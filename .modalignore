@@ -1,0 +1,33 @@
+# Old experiment outputs (checkpoints, logs) - multi-GB
+cifar10_*/
+cifar100_*/
+cub200_*/
+imagenet100_*/
+*_pseudo_mode*_*/
+*_baseline_*/
+
+
+# Agent worktrees - never needed on remote
+.claude/
+
+# Local caches
+__pycache__/
+**/__pycache__/
+dev_outputs/
+
+# Data dirs (data comes from Modal volume, not local mount)
+cifar10/
+cifar100/
+cub/
+ImageNet/
+imagenet/
+data_uq_idxs/
+
+# Git / editor noise
+.git/
+tensorboard/
+checkpoints/
+
+# Docs not needed for training
+*.md
+!README.md

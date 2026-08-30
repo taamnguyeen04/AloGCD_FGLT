@@ -2,12 +2,30 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment as linear_assignment
 import torch
 
-def set_args_mmf(args, train_loader):
-    train_loader_targets = train_loader.dataset.labelled_dataset.targets + train_loader.dataset.unlabelled_dataset.datasets[0].targets + train_loader.dataset.unlabelled_dataset.datasets[1].targets
+def get_dataset_targets(dataset):
+    if dataset is None:
+        return []
+    if hasattr(dataset, 'targets'):
+        return np.asarray(dataset.targets, dtype=int).tolist()
+    if hasattr(dataset, 'labels'):
+        return np.asarray(dataset.labels, dtype=int).tolist()
+    if hasattr(dataset, 'datasets'):
+        targets = []
+        for child in dataset.datasets:
+            targets.extend(get_dataset_targets(child))
+        return targets
+    if hasattr(dataset, 'labelled_dataset') and hasattr(dataset, 'unlabelled_dataset'):
+        return get_dataset_targets(dataset.labelled_dataset) + get_dataset_targets(dataset.unlabelled_dataset)
+    return []
 
-    labeled_num = len(torch.unique(torch.tensor(train_loader.dataset.labelled_dataset.targets)))
+
+def set_args_mmf(args, train_loader):
+    train_loader_targets = get_dataset_targets(train_loader.dataset)
+    labelled_targets = get_dataset_targets(train_loader.dataset.labelled_dataset)
+
+    labeled_num = len(torch.unique(torch.tensor(labelled_targets)))
     print(f'Labeled Classes Number: {labeled_num}')
-    print(f'Labeled Set Length: {len(train_loader.dataset.labelled_dataset.targets)}')
+    print(f'Labeled Set Length: {len(labelled_targets)}')
 
     print(f'Unlabeled Set Length: {len(train_loader_targets)}')
 

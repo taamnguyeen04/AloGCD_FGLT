@@ -116,9 +116,9 @@ def get_cifar_100_datasets(train_transform, test_transform, args=None):
     whole_training_set = CustomCIFAR100(root=cifar_100_root, train=True, transform=train_transform, download=True)
     whole_training_set.target_transform = None
 
-    l_k_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/l_k_uq_idxs.pt')
-    unl_unk_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/unl_unk_uq_idxs.pt')
-    unl_k_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/unl_k_uq_idxs.pt')
+    l_k_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/l_k_uq_idxs.pt', weights_only=False)
+    unl_unk_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/unl_unk_uq_idxs.pt', weights_only=False)
+    unl_k_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/unl_k_uq_idxs.pt', weights_only=False)
 
     train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k_uq_idxs)
     lt_unlabeled_known_dataset = subsample_dataset(deepcopy(whole_training_set), unl_k_uq_idxs)
@@ -140,9 +140,9 @@ def get_cifar_10_datasets(train_transform, test_transform, args=None):
     whole_training_set = CustomCIFAR10(root=cifar_10_root, train=True, transform=train_transform, download=True)
     whole_training_set.target_transform = None
 
-    l_k_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/l_k_uq_idxs.pt')
-    unl_unk_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/unl_unk_uq_idxs.pt')
-    unl_k_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/unl_k_uq_idxs.pt')
+    l_k_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/l_k_uq_idxs.pt', weights_only=False)
+    unl_unk_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/unl_unk_uq_idxs.pt', weights_only=False)
+    unl_k_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/unl_k_uq_idxs.pt', weights_only=False)
 
     train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k_uq_idxs)
     lt_unlabeled_known_dataset = subsample_dataset(deepcopy(whole_training_set), unl_k_uq_idxs)
