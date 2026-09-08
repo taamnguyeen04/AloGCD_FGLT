@@ -37,7 +37,7 @@ image = (
     .add_local_dir(
         ".", 
         remote_path=PROJECT_DIR, 
-        ignore=["cub200_*", "cifar10_*", "cifar100_*", "imagenet100_*", "dev_outputs", "checkpoints", "tensorboard", "__pycache__"]
+        ignore=["cub200_*", "cifar10_*", "cifar100_*", "imagenet100_*", "dev_outputs", "checkpoints", "tensorboard", "__pycache__", "venv", ".venv", ".git", "env"]
     )
 )
 
@@ -123,9 +123,11 @@ def _generate_experiment_name(
         variant_str = "baseline"
     elif variant == "pseudo":
         if pseudo_mode == 1:
-            variant_str = "pseudo_mode1"
+            variant_str = "pseudo_mode1_trainacc"
         elif pseudo_mode == 2:
             variant_str = f"pseudo_mode2_th{confidence_threshold:.2f}"
+        elif pseudo_mode == 3:
+            variant_str = "pseudo_mode3_bestconf"
         else:
             variant_str = f"pseudo_modeX"
     else:
@@ -148,7 +150,7 @@ def _generate_experiment_name(
 def train(
     dataset_name: str = "cifar100",
     imb_ratio: int = 100,
-    epochs: int = 200,
+    epochs: int = 100,
     batch_size: int = 1024,
     lr: float | None = None,
     gpu_count_workers: int = 8,
@@ -161,8 +163,18 @@ def train(
     max_samples_per_class: int = 500,
     pseudo_update_freq: int = 10,
     max_pseudo_iterations: int = 20,
+    pseudo_warmup_epoch: int = 30,
     # Visualization frequency (0 = off)
     vis_freq: int = 10,
+    # AdaPart arguments
+    use_parts: bool = False,
+    num_slots: int = 3,
+    part_lambda: float = 0.5,
+    ablate_fused_ce: bool = False,
+    ablate_spatial_loss: bool = False,
+    ablate_confidence: bool = False,
+    ablate_adaptive_capacity: bool = False,
+    ablate_concat_eval: bool = False,
     # Custom experiment name
     exp_name_suffix: str = "",
 ) -> dict:
@@ -243,7 +255,7 @@ def train(
         "--exp-name",
         dataset_name,
         "--warmup-teacher-temp-epochs",
-        str(min(30, epochs)),
+        str(min(50, epochs)),
         "--est-freq",
         "10",
         "--ce-warmup",
@@ -266,9 +278,26 @@ def train(
         command.extend(["--max-samples-per-class", str(max_samples_per_class)])
         command.extend(["--pseudo-update-freq", str(pseudo_update_freq)])
         command.extend(["--max-pseudo-iterations", str(max_pseudo_iterations)])
+        command.extend(["--pseudo-warmup-epoch", str(pseudo_warmup_epoch)])
 
     # Visualization frequency (PCA / t-SNE / confusion matrix)
     command.extend(["--vis-freq", str(vis_freq)])
+    
+    # AdaPart arguments
+    if use_parts:
+        command.append("--use-parts")
+        command.extend(["--num-slots", str(num_slots)])
+        command.extend(["--part-lambda", str(part_lambda)])
+        if ablate_fused_ce:
+            command.append("--ablate-fused-ce")
+        if ablate_spatial_loss:
+            command.append("--ablate-spatial-loss")
+        if ablate_confidence:
+            command.append("--ablate-confidence")
+        if ablate_adaptive_capacity:
+            command.append("--ablate-adaptive-capacity")
+        if ablate_concat_eval:
+            command.append("--ablate-concat-eval")
 
     # Learning rate
     if lr is not None:
@@ -350,7 +379,7 @@ def _download_visualizations(experiment_name: str) -> None:
 def main(
     dataset_name: str = "cifar100",
     imb_ratio: int = 100,
-    epochs: int = 200,
+    epochs: int = 100,
     batch_size: int = 1024,
     lr: float | None = None,
     num_workers: int = 8,
@@ -363,6 +392,16 @@ def main(
     max_samples_per_class: int = 500,
     pseudo_update_freq: int = 10,
     max_pseudo_iterations: int = 20,
+    pseudo_warmup_epoch: int = 30,
+    # AdaPart flags
+    use_parts: bool = False,
+    num_slots: int = 3,
+    part_lambda: float = 0.5,
+    ablate_fused_ce: bool = False,
+    ablate_spatial_loss: bool = False,
+    ablate_confidence: bool = False,
+    ablate_adaptive_capacity: bool = False,
+    ablate_concat_eval: bool = False,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -389,6 +428,16 @@ def main(
         max_samples_per_class=max_samples_per_class,
         pseudo_update_freq=pseudo_update_freq,
         max_pseudo_iterations=max_pseudo_iterations,
+        pseudo_warmup_epoch=pseudo_warmup_epoch,
+        # AdaPart flags
+        use_parts=use_parts,
+        num_slots=num_slots,
+        part_lambda=part_lambda,
+        ablate_fused_ce=ablate_fused_ce,
+        ablate_spatial_loss=ablate_spatial_loss,
+        ablate_confidence=ablate_confidence,
+        ablate_adaptive_capacity=ablate_adaptive_capacity,
+        ablate_concat_eval=ablate_concat_eval,
         # Visualization frequency (PCA / t-SNE / confusion matrix)
         vis_freq=vis_freq,
         # Custom experiment name
@@ -407,11 +456,12 @@ def main(
         _download_visualizations(result['experiment_name'])
 
 
+
 @app.local_entrypoint()
 def launch(
     dataset_name: str = "cifar100",
     imb_ratio: int = 100,
-    epochs: int = 200,
+    epochs: int = 100,
     batch_size: int = 1024,
     lr: float | None = None,
     num_workers: int = 8,
@@ -424,6 +474,16 @@ def launch(
     max_samples_per_class: int = 500,
     pseudo_update_freq: int = 10,
     max_pseudo_iterations: int = 20,
+    pseudo_warmup_epoch: int = 30,
+    # AdaPart flags
+    use_parts: bool = False,
+    num_slots: int = 3,
+    part_lambda: float = 0.5,
+    ablate_fused_ce: bool = False,
+    ablate_spatial_loss: bool = False,
+    ablate_confidence: bool = False,
+    ablate_adaptive_capacity: bool = False,
+    ablate_concat_eval: bool = False,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -438,13 +498,8 @@ def launch(
         modal run -d modal_train.py::launch ...
 
     Follow progress with:
-
-        modal app logs bacon-train          # stream logs (attach/detach freely)
-        modal app list                      # see running apps
-
-    Results live in the bacon-storage volume; download later with:
-
-        modal volume get bacon-storage "outputs/experiments/<exp>" dev_outputs/
+        modal app ls (to see the running app ID)
+        modal logs <app_id>
     """
     parsed_extra_args = extra_args.split() if extra_args else []
 
@@ -463,6 +518,15 @@ def launch(
         max_samples_per_class=max_samples_per_class,
         pseudo_update_freq=pseudo_update_freq,
         max_pseudo_iterations=max_pseudo_iterations,
+        pseudo_warmup_epoch=pseudo_warmup_epoch,
+        use_parts=use_parts,
+        num_slots=num_slots,
+        part_lambda=part_lambda,
+        ablate_fused_ce=ablate_fused_ce,
+        ablate_spatial_loss=ablate_spatial_loss,
+        ablate_confidence=ablate_confidence,
+        ablate_adaptive_capacity=ablate_adaptive_capacity,
+        ablate_concat_eval=ablate_concat_eval,
         vis_freq=vis_freq,
         exp_name_suffix=exp_name_suffix,
     )

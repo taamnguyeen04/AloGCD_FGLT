@@ -249,7 +249,14 @@ def log_accs_from_preds(y_true, y_pred, mask, eval_funcs, save_name, T=None,
         if print_output:
             old_std = np.array([acc_list[0], acc_list[1], acc_list[2]]).std()
             new_std = np.array([acc_list[3], acc_list[4], acc_list[5]]).std()
-            print_str = f'Epoch {T}, {log_name}: All {all_acc:.1f} | Old {old_acc:.1f} | New {new_acc:.1f} | '
+            
+            # Harmonic Mean (H)
+            if old_acc > 0 and new_acc > 0:
+                h_mean = 2 * old_acc * new_acc / (old_acc + new_acc)
+            else:
+                h_mean = 0.0
+                
+            print_str = f'Epoch {T}, {log_name}: All {all_acc:.1f} | Old {old_acc:.1f} | New {new_acc:.1f} | H {h_mean:.1f} | '
             print_str2 = f'KMany {acc_list[0]:.1f} | KMed {acc_list[1]:.1f} | KFew {acc_list[2]:.1f} | Std {old_std:.1f}'
             print_str3 = f'UMany {acc_list[3]:.1f} | UMed {acc_list[4]:.1f} | UFew {acc_list[5]:.1f} | Std {new_std:.1f}'
 

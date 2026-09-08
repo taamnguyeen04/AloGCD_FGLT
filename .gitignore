@@ -50,7 +50,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
-
+exp/
 # Translations
 *.mo
 *.pot
@@ -421,3 +421,9 @@ ablation/
 *.pt
 *.pth
 *.ckpt
+!data_uq_idxs/**/*.pt
+
+# Markdown docs (keep README)
+*.md
+!README.md
+!**/README.md

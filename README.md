@@ -162,3 +162,76 @@ Bias-evidence outputs (mặc định bật khi có pseudo labeling): `[PSEUDO AU
 ```bash
 bash run_cifar10.sh     # flag gạch-ngang, xem file để biết đầy đủ thông số
 ```
+
+### Hướng dẫn chạy AdaPart-BaCon tự động (Mới)
+
+Để chạy toàn bộ các cấu hình của mô hình AdaPart (bao gồm Main Config và Ablation Study), bạn có thể chạy file script tự động dưới đây. Script này sẽ lần lượt đẩy các cấu hình lên chạy dưới dạng background jobs trên Modal.
+
+```bash
+python scripts/run_experiments.py
+```
+
+**Ý nghĩa của các cờ (flags) trong AdaPart:**
+
+* `--use-parts`: Bật cơ chế Part-Aware (chia M slots).
+* `--num-slots`: Số lượng cụm bộ phận trên mỗi class (mặc định 3).
+* `--ablate-spatial-loss`: (Ablation) Tắt hàm Spatial Diversity Loss.
+* `--ablate-fused-ce`: (Ablation) Tắt Fused CE Loss (chỉ xài global logits).
+* `--ablate-adaptive-capacity`: (Ablation) Tắt Distribution-Adaptive Gating.
+* `--ablate-concat-eval`: (Ablation) Đánh giá test chỉ dùng CLS, không dùng Concat.
+* `--ablate-confidence`: (Ablation) Tắt lọc Margin Confidence khi update EMA.
+
+### Danh sách 13 lệnh thực nghiệm (Chạy thủ công)
+
+Nếu bạn không muốn chạy bằng script tự động, bạn có thể copy từng dòng dưới đây và dán vào terminal để chạy:
+
+
+```bash
+# ==========================================
+# 1. MAIN RESULTS (Thay đổi độ mất cân bằng)
+# ==========================================
+# CUB-200-LT Imbalance Ratio 10
+modal run -d modal_train.py::launch --exp-name-suffix AdaPart_Main_CUB_imb10 --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 3
+
+# CUB-200-LT Imbalance Ratio 20
+modal run -d modal_train.py::launch --exp-name-suffix AdaPart_Main_CUB_imb20 --dataset-name cub200 --imb-ratio 20 --enable-pseudo-labeling --use-parts --num-slots 3
+
+# CUB-200-LT Imbalance Ratio 50
+modal run -d modal_train.py::launch --exp-name-suffix AdaPart_Main_CUB_imb50 --dataset-name cub200 --imb-ratio 50 --enable-pseudo-labeling --use-parts --num-slots 3
+
+# ==========================================
+# 2. ABLATION STUDY (Trực tiếp trên CUB imb10)
+# ==========================================
+# Row 1: BaCon gốc (Không dùng AdaPart, Không dùng Pseudo-labeling)
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row1_Baseline --dataset-name cub200 --imb-ratio 10
+
+# Row 2: BaCon gốc + Pseudo-labeling Mode 1 (Không dùng AdaPart)
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row2_PseudoOnly --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling
+
+# Row 4: Tắt Spatial Diversity Loss
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row4_NoSpatial --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 3 --ablate-spatial-loss
+
+# Row 5: Tắt Fused CE Loss (Chỉ dùng Global logits)
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row5_NoFusedCE --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 3 --ablate-fused-ce
+
+# Row 6: Tắt Confidence Filtering (EMA update mù)
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row6_NoConf --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 3 --ablate-confidence
+
+# Row 7: Tắt Distribution-Adaptive Gating (Gate tĩnh)
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row7_NoAdaptiveCap --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 3 --ablate-adaptive-capacity
+
+# Row 8: Tắt Concat Eval (Đánh giá K-Means chỉ bằng CLS, không dùng Part pool)
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row8_NoConcatEval --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 3 --ablate-concat-eval
+
+# Row 9 (M=2): Đổi số lượng Part Slot thành 2
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row9_M2 --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 2
+
+# Row 9 (M=4): Đổi số lượng Part Slot thành 4
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row9_M4 --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 4
+
+# Row 9 (M=5): Đổi số lượng Part Slot thành 5
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row9_M5 --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 5
+
+# Row 10: Full AdaPart (Cấu hình mạnh nhất, bật tất cả)
+modal run -d modal_train.py::launch --exp-name-suffix Ablation_Row10_Full_AdaPart --dataset-name cub200 --imb-ratio 10 --enable-pseudo-labeling --use-parts --num-slots 3
+```

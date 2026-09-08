@@ -93,7 +93,61 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     args.current_epoch = 0
     best_test_acc_all_cl = -1
     best_epoch = -1
-    
+
+    # ----------------------
+    # ADAPART MODULE INIT
+    # ----------------------
+    part_module = None
+    part_bank = None
+    optimizer_part = None
+    optimizer_gate = None
+    scheduler_part = None
+    scheduler_gate = None
+
+    if getattr(args, 'use_parts', False):
+        from model.part_modules import (
+            LatentPartModule, PartPrototypeBank,
+            compute_spatial_loss, compute_fused_ce_loss,
+            compute_margin_confidence, compute_target_capacity,
+            compute_dist_adaptive_gate_loss, compute_gate_reg_loss,
+        )
+        d = args.feat_dim  # 768 for ViT-B/16
+        M = args.num_slots
+        C = args.num_classes
+
+        part_module = LatentPartModule(dim=d, num_slots=M).to(device)
+        part_bank = PartPrototypeBank(num_classes=C, num_slots=M, dim=d).to(device)
+
+        # part queries + cl late blocks learnable; gate LR riêng; prototypes EMA-only
+        nn.init.constant_(part_bank.gate_logits, -1.0)  # a≈0.27, để fused CE mở dần thay vì sập
+        optimizer_part = SGD(part_module.parameters(), lr=0.05, momentum=0.9, weight_decay=1e-4)
+        optimizer_gate = SGD([part_bank.gate_logits], lr=0.01, momentum=0.9)
+        # Cho part loss update trực tiếp backbone nó đang đứng (fix dead-gradient)
+        cl_late_params = [p for n, p in cl_backbone.named_parameters()
+                          if ('block.11' in n or 'norm' in n) and p.requires_grad]
+        if len(cl_late_params) > 0:
+            optimizer_part.add_param_group({'params': cl_late_params, 'lr': 0.01})
+        scheduler_part = lr_scheduler.CosineAnnealingLR(
+            optimizer_part, T_max=args.epochs, eta_min=0.05 * 1e-3)
+        scheduler_gate = lr_scheduler.CosineAnnealingLR(
+            optimizer_gate, T_max=args.epochs, eta_min=0.01 * 1e-3)
+
+        # MVP default: spatial OFF (harmful: Row4_NoSpatial 53.62 > Row2 52.87).
+        # Muốn bật lại phải opt-in rõ ràng: --use-spatial-loss (và không truyền --ablate-spatial-loss).
+        if not getattr(args, 'use_spatial_loss', False):
+            args.ablate_spatial_loss = True
+        # Expose part refs cho test() ngay từ đầu (tránh phụ thuộc scheduler step).
+        args._part_module_ref = part_module
+        args._part_bank_ref = part_bank
+
+        args.logger.info(f'[AdaPart] Enabled: M={M} slots, C={C} classes, d={d}')
+        args.logger.info(f'[AdaPart] Ablations: fused_ce={not args.ablate_fused_ce}, '
+                         f'spatial={not args.ablate_spatial_loss}, '
+                         f'confidence={not args.ablate_confidence}, '
+                         f'adaptive_cap={not args.ablate_adaptive_capacity}, '
+                         f'concat_eval={not args.ablate_concat_eval}')
+
+
     # Pseudo labeling state (Fine-Grained GCD)
     if args.enable_pseudo_labeling:
         pseudo_iteration = 0
@@ -128,6 +182,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         args.current_epoch = epoch
         loss_record_ce = AverageMeter()
         loss_record_cl = AverageMeter()
+        ema_purity_record = AverageMeter()
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
         for batch_idx, batch in enumerate(pbar):
             images_, class_labels, uq_idxs, mask_lab = batch
@@ -151,8 +206,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             for i, blk in enumerate(cl_backbone.blocks):
                 if i >= args.grad_from_block:
                     cl_backbone_feature = blk(x)
-            cl_backbone_feature = cl_backbone.norm(cl_backbone_feature)
-            cl_backbone_feature = cl_backbone_feature[:, 0]
+            cl_full = cl_backbone.norm(cl_backbone_feature)
+            cl_backbone_feature = cl_full[:, 0]
+            cl_patch_tokens = cl_full[:, 1:]
             cl_proj_feature = cl_head(cl_backbone_feature)
 
             ####################### COMPUTE LOSS #######################
@@ -176,12 +232,99 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             cluster_loss += args.memax_weight * me_max_loss
             loss_ce = (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
 
-            loss_record_ce.update(loss_ce.item(), class_labels.size(0))
-            optimizer_ce.zero_grad()
-            loss_ce.backward()
-            optimizer_ce.step()
+            # ---- AdaPart losses (appended to loss_ce) ----
+            if part_module is not None:
+                # Forward: patch_tokens -> part features (B*n_views, M, d)
+                r_norm, A = part_module(cl_patch_tokens)
+
+                # 1. Spatial diversity loss on attention maps
+                if not args.ablate_spatial_loss and epoch >= 50:
+                    loss_spatial, _, _ = compute_spatial_loss(A)
+                    loss_ce = loss_ce + 0.05 * loss_spatial
+                    pstr += f'spatial: {loss_spatial.item():.2f} '
+
+                # 2. Fused CE loss on labeled subset only (using view 0)
+                if not args.ablate_fused_ce:
+                    B_total = class_labels.shape[0]
+                    B_half = B_total // args.n_views
+                    r_norm_v0 = r_norm[:B_half]           # (B, M, d) view 0
+                    mask_lab_v0 = mask_lab[:B_half]
+
+                    if mask_lab_v0.sum() > 0:
+                        g_part, _, a = part_bank(r_norm_v0)
+
+                        # Fused with global logits (normalized to same scale)
+                        g_global_v0 = student_out[:B_half]
+                        fused_labels = class_labels[:B_half][mask_lab_v0]
+
+                        loss_fused, g_fused = compute_fused_ce_loss(
+                            g_global_v0[mask_lab_v0],
+                            g_part[mask_lab_v0],
+                            fused_labels,
+                            lambda_part=args.part_lambda,
+                            tau=args.tau_c,
+                        )
+                        loss_ce = loss_ce + loss_fused
+                        pstr += f'fused_ce: {loss_fused.item():.2f} '
+                        
+                        gate_max = a.max(dim=-1)[0].mean().item()
+                        pstr += f'gate_max: {gate_max:.2f} '
+
+                        # Gate regularization
+                        loss_gate, _, _ = compute_gate_reg_loss(a)
+                        loss_ce = loss_ce + 0.05 * loss_gate
+
+                        # Distribution-adaptive gating
+                        if not args.ablate_adaptive_capacity and est_count is not None:
+                            pi_hat = torch.tensor(est_count, dtype=torch.float, device=device)
+                            M_target = compute_target_capacity(pi_hat, args.num_slots)
+                            loss_dist = compute_dist_adaptive_gate_loss(a, M_target)
+                            loss_ce = loss_ce + 0.05 * loss_dist
+                            pstr += f'dist_gate: {loss_dist.item():.2f} '
+
+                optimizer_part.zero_grad()
+                optimizer_gate.zero_grad()
+                optimizer_ce.zero_grad()
+                optimizer_cl.zero_grad()
+                loss_ce.backward(retain_graph=True)
+                # loss_ce chứa fused CE -> grad đi vào ce + part queries/gate + cl late blocks.
+                # Giữ grad cl lại, cộng dồn loss_cl bên dưới rồi mới step một lần.
+                loss_record_ce.update(loss_ce.item(), class_labels.size(0))
+            else:
+                loss_record_ce.update(loss_ce.item(), class_labels.size(0))
+                optimizer_ce.zero_grad()
+                loss_ce.backward()
+                optimizer_ce.step()
+
+            # --- EMA prototype update (after warmup) ---
+            ema_start = min(30, args.epochs - 1)
+            if part_module is not None and epoch >= ema_start:
+                with torch.no_grad():
+                    B_half = class_labels.shape[0] // args.n_views
+                    r_v0 = r_norm[:B_half].detach()
+                    lab_v0 = class_labels[:B_half]
+                    mask_v0 = mask_lab[:B_half]
+
+                    # Known class EMA
+                    if mask_v0.sum() > 0:
+                        part_bank.update_ema(r_v0[mask_v0], lab_v0[mask_v0])
+
+                    # Novel class EMA with confidence filtering
+                    if not mask_v0.all() and not args.ablate_confidence:
+                        if ema_start <= epoch <= 60:
+                            g_fused_all = student_out[:B_half] + args.part_lambda * part_bank(r_v0)[0]
+                            novel_mask = ~mask_v0
+                            pseudo_pred = g_fused_all[novel_mask].argmax(dim=-1)
+                            w = torch.softmax(g_fused_all[novel_mask] / args.tau_c, dim=-1).max(dim=-1)[0]
+                            part_bank.update_ema_novel(
+                                r_v0[novel_mask], pseudo_pred, w)
+                            
+                            if novel_mask.sum() > 0:
+                                purity = (pseudo_pred == lab_v0[novel_mask]).float().mean()
+                                ema_purity_record.update(purity.item(), novel_mask.sum().item())
 
             loss_cl = 0
+
             # for CL part
             # represent learning, unsup
             cl_proj_feature = torch.nn.functional.normalize(cl_proj_feature, dim=-1)
@@ -206,9 +349,18 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             pstr += f'contrastive_loss: {contrastive_loss.item():.2f} '
 
             loss_record_cl.update(loss_cl.item(), class_labels.size(0))
-            optimizer_cl.zero_grad()
-            loss_cl.backward()
-            optimizer_cl.step()
+            if part_module is not None:
+                # Cộng dồn grad contrastive vào grad part đã có, rồi step cả 4 optimizer một lần.
+                # Không zero_grad ở đây vì đã zero trước loss_ce.backward().
+                loss_cl.backward()
+                optimizer_ce.step()
+                optimizer_cl.step()
+                optimizer_part.step()
+                optimizer_gate.step()
+            else:
+                optimizer_cl.zero_grad()
+                loss_cl.backward()
+                optimizer_cl.step()
 
             if batch_idx % args.print_freq == 0:
                 pbar.set_postfix({
@@ -218,6 +370,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 })
 
         args.logger.info('Train Epoch: {} Avg Loss_ce: {:.2f} Avg Loss_cl: {:.2f}'.format(epoch, loss_record_ce.avg, loss_record_cl.avg))
+        if (epoch % 10 == 0 or epoch == args.epochs - 1) and ema_purity_record.count > 0:
+            args.logger.info(f"[EMA-Novel] purity={ema_purity_record.avg:.3f}")
 
         if (epoch+1) % args.est_freq == 0:
             set_model(eval=True)
@@ -254,7 +408,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         
         # Pseudo Labeling Update Logic (Fine-Grained GCD)
         if args.enable_pseudo_labeling and args.pseudo_update_freq > 0:
-            should_update = (epoch > 0) and (epoch % args.pseudo_update_freq == 0)
+            warmup = getattr(args, 'pseudo_warmup_epoch', 30)
+            should_update = (epoch >= warmup) and ((epoch - warmup) % args.pseudo_update_freq == 0)
             
             if should_update and pseudo_iteration < args.max_pseudo_iterations:
                 pseudo_iteration += 1
@@ -269,12 +424,31 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 )
                 
                 if args.pseudo_mode == 1:
-                    # Find best class
-                    best_class = max(per_class_stats.keys(), 
-                                   key=lambda c: per_class_stats[c]['acc'])
-                    best_acc = per_class_stats[best_class]['acc']
-                    
-                    args.logger.info(f"[MODE 1] Best class: {best_class} (Acc: {best_acc:.3f})")
+                    # Cach A: best TRAIN-acc (sach). Dung train GT, khong dung test GT.
+                    # train_labelled_test_trans_loader la global duoc tao o __main__
+                    # (train labelled + test transform, single view).
+                    try:
+                        lab_loader = train_labelled_test_trans_loader
+                    except NameError:
+                        lab_loader = DataLoader(
+                            train_loader.dataset.labelled_dataset,
+                            batch_size=256, shuffle=False, num_workers=0
+                        )
+                    train_stats = evaluate_train_labeled_per_class_accuracy(
+                        student_ce, lab_loader, args.num_labeled_classes)
+                    best_class = max(train_stats.keys(),
+                                     key=lambda c: train_stats[c]['acc'])
+                    best_acc = train_stats[best_class]['acc']
+
+                    args.logger.info(f"[MODE 1-CachA] Best train class: {best_class} (train-acc: {best_acc:.3f})")
+                    target_class = best_class
+                elif args.pseudo_mode == 3:
+                    # Cach B: best unsupervised conf tren train-unlabeled, khong can GT nao.
+                    best_class, scores, details = compute_unsupervised_class_scores(
+                        student_ce, unlab_loader, args.num_labeled_classes)
+                    d = details[best_class]
+                    args.logger.info(f"[MODE 3-CachB] Best conf class: {best_class} "
+                                     f"(mean_conf: {d['mean_conf']:.3f}, n: {d['n']}, n_hi09: {d['n_hi09']})")
                     target_class = best_class
                 else:
                     target_class = None
@@ -293,7 +467,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 )
                 used_pseudo_uq_idxs |= newly_used
 
-                if args.pseudo_mode == 1:
+                if args.pseudo_mode in (1, 3):
                     args.logger.info(f"Collected {len(new_pseudo)} pseudo samples for class {target_class}")
                 else:
                     args.logger.info(f"Collected {len(new_pseudo)} pseudo samples across classes (th>={getattr(args, 'confidence_threshold', 0.9)})")
@@ -338,6 +512,14 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         # Step schedule
         exp_lr_scheduler_ce.step()
         exp_lr_scheduler_cl.step()
+        if scheduler_part is not None:
+            scheduler_part.step()
+        if scheduler_gate is not None:
+            scheduler_gate.step()
+        if part_module is not None:
+            # Giữ refs tươi cho test() (concat eval gate-weighted).
+            args._part_module_ref = part_module
+            args._part_bank_ref = part_bank
 
         if epoch % args.test_freq == 0 and all_acc_test_cl > best_test_acc_all_cl:
 
@@ -423,6 +605,31 @@ def test(model, test_loader, epoch, save_name, args, train_loader):
 
         # Pass features through base model and then additional learnable transform (linear layer)
         feats = model[0](images)  # follow GCD: clustering on normalized backbone feature
+
+        # AdaPart Concat Eval: [z_cls || r_pool] khi bật.
+        # r_pool = gate-weighted (không mean đều): slot nào gate của class dự đoán
+        # cao thì đóng góp nhiều. Tránh pha loãng cue mà gate vừa học (việc 3).
+        if (getattr(args, 'use_parts', False)
+                and not getattr(args, 'ablate_concat_eval', False)
+                and getattr(args, '_part_module_ref', None) is not None):
+            with torch.no_grad():
+                backbone = model[0]
+                x = backbone.prepare_tokens(images)
+                for i, blk in enumerate(backbone.blocks):
+                    x = blk(x)
+                x = backbone.norm(x)
+                patch_tokens = x[:, 1:]
+                r_norm, _ = args._part_module_ref(patch_tokens)
+                bank = getattr(args, '_part_bank_ref', None)
+                if bank is not None:
+                    # part-only pred (eval không có ce_head/fused logits) để chọn gate.
+                    g_part_eval, _, a_eval = bank(r_norm)
+                    pred_eval = g_part_eval.argmax(dim=-1)  # (B,)
+                    a_pred = a_eval[pred_eval]              # (B, M)
+                    r_pool = (r_norm * a_pred.unsqueeze(-1)).sum(dim=1) / (a_pred.sum(dim=1, keepdim=True) + 1e-6)
+                else:
+                    r_pool = r_norm.mean(dim=1)  # fallback khi thiếu bank ref
+                feats = torch.cat([x[:, 0], r_pool], dim=-1)
 
         feats = torch.nn.functional.normalize(feats, dim=-1)
 
@@ -559,12 +766,91 @@ def log_per_class_stats(per_class_stats, epoch=None, args=None):
 # PSEUDO LABELING UPDATE LOGIC
 # ============================================================================
 
+def evaluate_train_labeled_per_class_accuracy(model, labelled_loader, num_labeled, device='cuda'):
+    """Cach A (Mode 1 moi): per-class accuracy tren TAP TRAIN-LABELED (sach, khong dung test).
+
+    Dung classifier cua CE branch (backbone+head), khong KMeans, khong Hungarian.
+    Chi dung train GT labels -> khong leak test.
+    Returns dict {c: {'correct','total','acc'}} cho c in range(num_labeled).
+    """
+    import torch.nn.functional as F
+
+    model.eval()
+    stats = {c: {'correct': 0, 'total': 0} for c in range(num_labeled)}
+    with torch.no_grad():
+        for batch in labelled_loader:
+            images = batch[0]
+            labels = batch[1]
+            if isinstance(images, (list, tuple)):
+                images = images[0]
+            images = images.to(device)
+            if not torch.is_tensor(labels):
+                labels = torch.tensor(labels)
+            labels = labels.to(device)
+
+            feats = model[0](images)
+            feats = F.normalize(feats, dim=-1)
+            logits = model[1](feats)
+            preds = logits.argmax(dim=1)
+            for p, t in zip(preds, labels):
+                t = int(t.item())
+                if 0 <= t < num_labeled:
+                    stats[t]['total'] += 1
+                    if int(p.item()) == t:
+                        stats[t]['correct'] += 1
+    for c in stats:
+        tot = stats[c]['total']
+        stats[c]['acc'] = stats[c]['correct'] / tot if tot > 0 else 0.0
+    return stats
+
+
+def compute_unsupervised_class_scores(model, unlab_loader, num_labeled, device='cuda', min_count=50):
+    """Cach B (Mode 3): chon best class bang confidence tren TRAIN-UNLABELED, khong can GT nao.
+
+    Voi moi predicted old class c: mean max-softmax + high-conf count.
+    best = argmax mean_conf trong so cac class co du min_count mau.
+    Returns (best_class, scores, details).
+    """
+    import torch.nn.functional as F
+
+    model.eval()
+    conf_lists = {c: [] for c in range(num_labeled)}
+    with torch.no_grad():
+        for batch in unlab_loader:
+            images = batch[0]
+            if isinstance(images, (list, tuple)):
+                images = images[0]
+            images = images.to(device)
+
+            feats = model[0](images)
+            feats = F.normalize(feats, dim=-1)
+            logits = model[1](feats)
+            probs = F.softmax(logits, dim=1)
+            confs, preds = probs.max(dim=1)
+            for p, c in zip(preds, confs):
+                p = int(p.item())
+                if 0 <= p < num_labeled:
+                    conf_lists[p].append(float(c.item()))
+    scores, details = {}, {}
+    for c, lst in conf_lists.items():
+        n = len(lst)
+        mean_c = sum(lst) / n if n > 0 else 0.0
+        hi = sum(1 for v in lst if v >= 0.9)
+        scores[c] = mean_c
+        details[c] = {'n': n, 'mean_conf': mean_c, 'n_hi09': hi}
+    eligible = {c: s for c, s in scores.items() if details[c]['n'] >= min_count}
+    pool = eligible if eligible else scores
+    best_class = max(pool.keys(), key=lambda c: pool[c])
+    return best_class, scores, details
+
+
 def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_class, max_samples, threshold,
                                          used_uq_idxs=None, top_ratio=0.8, max_label=None, device='cuda'):
     """Collect high-confidence samples based on the selected pseudo labeling mode.
 
-    mode 1: samples predicted as target_class, keep the top_ratio fraction with
-            highest confidence (capped at max_samples).
+    mode 1 (Cach A: best TRAIN-acc) / mode 3 (Cach B: best unsupervised conf):
+            samples predicted as target_class, keep the top_ratio fraction with
+            highest confidence (capped at max_samples). Khong dung test GT.
     mode 2: any class with confidence >= threshold, capped at max_samples per
             predicted class; if max_label is set, only classes < max_label are
             eligible (their head dims are trained with real CE labels).
@@ -603,7 +889,7 @@ def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_c
                 p = pred.item()
                 c = conf.item()
 
-                if mode == 1:
+                if mode in (1, 3):
                     if p == target_class:
                         candidates.append({'image': img.cpu(), 'label': p,
                                            'confidence': c, 'uq_idx': uq})
@@ -612,8 +898,8 @@ def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_c
                         candidates.append({'image': img.cpu(), 'label': p,
                                            'confidence': c, 'uq_idx': uq})
 
-    # Mode 1: keep top_ratio fraction by confidence (user request: e.g. best 80%)
-    if mode == 1:
+    # Mode 1/3: keep top_ratio fraction by confidence (user request: e.g. best 80%)
+    if mode in (1, 3):
         candidates.sort(key=lambda s: s['confidence'], reverse=True)
         n_keep = int(len(candidates) * top_ratio)
         n_keep = min(n_keep, max_samples)
@@ -990,16 +1276,33 @@ if __name__ == "__main__":
     parser.add_argument('--stop-epoch', default=200, type=int)
     parser.add_argument('--imb-ratio', default=100, type=int)
     parser.add_argument("--enable-pseudo-labeling", action="store_true", default=False)
-    parser.add_argument("--pseudo-mode", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--pseudo-mode", type=int, default=1, choices=[1, 2, 3],
+                        help="1=best TRAIN-acc (Cach A, sach), 2=threshold rai deu, 3=best conf unsupervised (Cach B, sach)")
     parser.add_argument("--confidence-threshold", type=float, default=0.9)
     parser.add_argument("--pseudo-top-ratio", type=float, default=0.8,
-                        help="Mode 1: fraction of highest-confidence target-class samples to keep")
+                        help="Mode 1/3: fraction of highest-confidence target-class samples to keep")
     parser.add_argument("--max-samples-per-class", type=int, default=500)
     parser.add_argument("--pseudo-update-freq", type=int, default=1)
     parser.add_argument("--max-pseudo-iterations", type=int, default=3)
+    parser.add_argument("--pseudo-warmup-epoch", type=int, default=30,
+                        help="Chi bat dau bom pseudo tu epoch nay (cho feature/head on dinh)")
     parser.add_argument("--use-exact-exp-root", action="store_true", default=False)
     parser.add_argument("--vis-freq", type=int, default=10,
-                        help="Generate PCA/t-SNE/confusion every N test epochs (0 = off)")
+                        help="How often (epochs) to generate PCA, t-SNE, Confusion Matrices")
+    
+    # Phase 5: AdaPart-BaCon arguments and Ablations
+    parser.add_argument("--use-parts", action="store_true", default=False, help="Enable AdaPart-BaCon architecture")
+    parser.add_argument("--num-slots", type=int, default=3, help="Number of latent part slots (M)")
+    parser.add_argument("--part-lambda", type=float, default=0.5, help="Weight for part logits in fused score")
+    parser.add_argument("--tau-c", type=float, default=0.1, help="Temperature for Fused CE Loss")
+    
+    parser.add_argument("--ablate-fused-ce", action="store_true", default=False, help="Disable fused CE loss (W1 baseline)")
+    parser.add_argument("--ablate-spatial-loss", action="store_true", default=False, help="Disable spatial diversity loss")
+    parser.add_argument("--use-spatial-loss", action="store_true", default=False,
+                        help="Opt-in to enable spatial diversity loss (MVP default OFF: harmful, see Row4_NoSpatial)")
+    parser.add_argument("--ablate-confidence", action="store_true", default=False, help="Disable confidence filtering for novel updates")
+    parser.add_argument("--ablate-adaptive-capacity", action="store_true", default=False, help="Disable distribution-adaptive gating")
+    parser.add_argument("--ablate-concat-eval", action="store_true", default=False, help="Evaluate using CLS only instead of Concat (W2 baseline)")
 
     # ----------------------
     # INIT

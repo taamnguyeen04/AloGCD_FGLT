@@ -96,7 +96,7 @@ def main():
     for c in unknown_classes:
         unl_unk.extend(counts[c])
 
-    out_dir = os.path.join(args.out_root, f'cub200_k{args.num_known}_imbrho{args.imb_ratio}')
+    out_dir = os.path.join(args.out_root, f'cub200_k{args.num_known}_imb{args.imb_ratio}')
     os.makedirs(out_dir, exist_ok=True)
     for name, arr in [('l_k_uq_idxs', l_k), ('unl_k_uq_idxs', unl_k),
                       ('unl_unk_uq_idxs', unl_unk)]:
