@@ -291,6 +291,8 @@ def save_final_report(accs, args, extra_info=None):
         'all', 'old', 'new'                       — headline accuracies
         'k_many', 'k_med', 'k_few', 'k_std'       — known-class subsets
         'u_many', 'u_med', 'u_few', 'u_std'       — novel-class subsets
+        'nmi', 'ari' (optional)                   — clustering structure,
+                                                    None-safe (old callers omit)
     :param extra_info: optional dict of scalar metadata (dataset, epochs, ...)
     :return: path to the txt report
     """
@@ -325,6 +327,12 @@ def save_final_report(accs, args, extra_info=None):
                      f'{_fmt(accs["k_few"]):<8} {_fmt(std_k):<5} | '
                      f'{_fmt(accs["u_many"]):<9} {_fmt(accs["u_med"]):<8} '
                      f'{_fmt(accs["u_few"]):<8} {_fmt(std_u):<5}')
+        nmi, ari = accs.get('nmi'), accs.get('ari')
+        if nmi is not None or ari is not None:
+            nmi_s = f'{nmi:.3f}' if isinstance(nmi, (int, float)) else 'n/a'
+            ari_s = f'{ari:.3f}' if isinstance(ari, (int, float)) else 'n/a'
+            lines.append(f'Clustering structure (overall, no Hungarian needed): '
+                         f'NMI {nmi_s} | ARI {ari_s}')
         lines.append(sep)
 
         text = '\n'.join(lines)
@@ -340,10 +348,14 @@ def save_final_report(accs, args, extra_info=None):
                     w.writerow([k, v])
             for key in ['old', 'new', 'all',
                         'k_many', 'k_med', 'k_few', 'k_std',
-                        'u_many', 'u_med', 'u_few', 'u_std']:
+                        'u_many', 'u_med', 'u_few', 'u_std',
+                        'nmi', 'ari']:
                 v = std_k if key == 'k_std' else (std_u if key == 'u_std'
                                                   else accs.get(key))
-                w.writerow([key, f'{v:.2f}' if isinstance(v, (int, float)) else v])
+                if v is None and key in ('nmi', 'ari'):
+                    continue  # old callers without NMI/ARI keep a 12-row csv
+                w.writerow([key, f'{v:.4f}' if isinstance(v, (int, float)) and key in ('nmi', 'ari')
+                            else (f'{v:.2f}' if isinstance(v, (int, float)) else v)])
 
         args.logger.info('\n' + text)
         args.logger.info(f'[FINAL REPORT] Saved to {report_path} and {csv_path}')

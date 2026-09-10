@@ -55,17 +55,20 @@ class PartAwareModel(nn.Module):
         self.grad_from_block = grad_from_block
 
     def forward(self, images):
-        x = self.backbone.prepare_tokens(images)
-        for i, blk in enumerate(self.backbone.blocks):
-            if i < self.grad_from_block:
-                with torch.no_grad():
-                    x = blk(x)
-            else:
-                x = blk(x)
-        x = self.backbone.norm(x)  # (B, N+1, d)
+        import torch
+        from model.backbone import (forward_blocks_from,
+                                    forward_frozen_prefix,
+                                    split_cls_patches)
+        with torch.no_grad():
+            x = forward_frozen_prefix(self.backbone, images, self.grad_from_block)
+        # Late blocks keep grad (requires_grad flags decide); matches the
+        # train_dual convention where only blocks >= grad_from_block learn.
+        # NOTE: x is detached here (eval wrapper); for training-time grad flow
+        # through late blocks, callers should use train_dual's path instead.
+        x = forward_blocks_from(x, self.backbone, self.grad_from_block)
+        x = self.backbone.norm(x)  # (B, 1 + n_reg + N, d)
 
-        z_cls = x[:, 0]          # (B, d)
-        patch_tokens = x[:, 1:]  # (B, N, d)
+        z_cls, patch_tokens = split_cls_patches(x, self.backbone)
 
         r_norm, _ = self.part_module(patch_tokens)  # (B, M, d)
         if self.part_bank is not None:

@@ -164,6 +164,30 @@ def split_cluster_acc_v2(y_true, y_pred, mask, train_loader, args):
     return total_acc, old_acc, new_acc, acc_list, ind_map
 
 
+def compute_nmi_ari(y_true, y_pred):
+    """Label-free clustering quality: NMI in [0,1], ARI (chance-adjusted, <=1).
+
+    Unlike ACC these need no Hungarian alignment (permutation-invariant), so they
+    expose structural failures (e.g. novel samples herded into head clusters) that
+    a lucky cluster->class mapping can hide. Returns (nmi, ari) as floats, or
+    (None, None) if sklearn is unavailable.
+    """
+    try:
+        from sklearn.metrics import (adjusted_rand_score,
+                                     normalized_mutual_info_score)
+    except Exception:
+        return None, None
+    try:
+        y_true = np.asarray(y_true, dtype=int)
+        y_pred = np.asarray(y_pred, dtype=int)
+        nmi = float(normalized_mutual_info_score(
+            y_true, y_pred, average_method='arithmetic'))
+        ari = float(adjusted_rand_score(y_true, y_pred))
+        return nmi, ari
+    except Exception:
+        return None, None
+
+
 def split_cluster_acc_v2_balanced(y_true, y_pred, mask):
     """
     Calculate clustering accuracy. Require scikit-learn installed
@@ -237,6 +261,10 @@ def log_accs_from_preds(y_true, y_pred, mask, eval_funcs, save_name, T=None,
     y_true = y_true.astype(int)
     y_pred = y_pred.astype(int)
 
+    # Clustering structure metrics (no Hungarian needed). Logged once per call;
+    # returned alongside ACC so final_report.csv can carry NMI/ARI columns.
+    nmi, ari = compute_nmi_ari(y_true, y_pred)
+
     for i, f_name in enumerate(eval_funcs):
 
         acc_f = EVAL_FUNCS[f_name]
@@ -247,6 +275,8 @@ def log_accs_from_preds(y_true, y_pred, mask, eval_funcs, save_name, T=None,
             to_return = (all_acc, old_acc, new_acc, acc_list, ind_map)
 
         if print_output:
+            nmi_str = f'{nmi:.3f}' if nmi is not None else 'n/a'
+            ari_str = f'{ari:.3f}' if ari is not None else 'n/a'
             old_std = np.array([acc_list[0], acc_list[1], acc_list[2]]).std()
             new_std = np.array([acc_list[3], acc_list[4], acc_list[5]]).std()
             
@@ -264,8 +294,10 @@ def log_accs_from_preds(y_true, y_pred, mask, eval_funcs, save_name, T=None,
                 args.logger.info(print_str)
                 args.logger.info(print_str2)
                 args.logger.info(print_str3)
+                args.logger.info(f'Clustering structure: NMI {nmi_str} | ARI {ari_str}')
             except:
                 print(print_str)
                 print(print_str2)
                 print(print_str3)
-    return to_return
+                print(f'Clustering structure: NMI {nmi_str} | ARI {ari_str}')
+    return to_return + (nmi, ari)

@@ -25,9 +25,12 @@ def plot_attention_maps(image_tensor, attention_map, save_path, M=3):
     axes[0].set_title('Original Image')
     
     # Plot attention for each slot
+    # Grid size is dynamic: 196 patches (ViT/16) -> 14x14, 256 (DINOv2/14) -> 16x16
+    N = attention_map.shape[1]
+    _h = _w = int(round(N ** 0.5))
+    assert _h * _w == N, f'non-square patch grid N={N}'
     for m in range(M):
-        # Reshape 196 -> 14x14
-        attn = attention_map[m].reshape(14, 14).detach().cpu().numpy()
+        attn = attention_map[m].reshape(_h, _w).detach().cpu().numpy()
         
         # Resize to 224x224
         attn_resized = cv2.resize(attn, (224, 224), interpolation=cv2.INTER_CUBIC)
@@ -75,16 +78,27 @@ def plot_gate_heatmap(gate_values, class_frequencies, save_path):
 def test_visualizations():
     os.makedirs('dev_outputs/visualizations', exist_ok=True)
     
-    # 1. Mock Attention Map Visualization
+    # 1. Mock Attention Map Visualization (both ViT/16 N=196 and DINOv2/14 N=256)
     print("Generating mock Attention Map...")
     image = torch.randn(3, 224, 224)
-    # create a focused attention blob for each slot
-    attn_map = torch.rand(3, 196) * 0.1
-    attn_map[0, 50:60] = 1.0 # Slot 1 focuses on top region
-    attn_map[1, 100:110] = 1.0 # Slot 2 focuses on center
-    attn_map[2, 150:160] = 1.0 # Slot 3 focuses on bottom
-    
-    plot_attention_maps(image, attn_map, 'dev_outputs/visualizations/mock_attention.png')
+    for N, tag in ((196, 'vit16'), (256, 'dinov214')):
+        # create a focused attention blob for each slot
+        attn_map = torch.rand(3, N) * 0.1
+        attn_map[0, N // 4:N // 4 + 10] = 1.0  # Slot 1 focuses on top region
+        attn_map[1, N // 2:N // 2 + 10] = 1.0  # Slot 2 focuses on center
+        attn_map[2, 3 * N // 4:3 * N // 4 + 10] = 1.0  # Slot 3 focuses on bottom
+        plot_attention_maps(image, attn_map,
+                            f'dev_outputs/visualizations/mock_attention_{tag}.png')
+
+    # Non-square N must fail loudly instead of silently misshaping
+    # (NB: 100 is square (10x10) — use a truly non-square N like 150.)
+    try:
+        plot_attention_maps(image, torch.rand(3, 150), 'dev_outputs/visualizations/never.png')
+        _guard_ok = False
+    except AssertionError as e:
+        _guard_ok = 'non-square' in str(e)
+    assert _guard_ok, 'non-square guard failed for N=150'
+    print('Non-square guard OK.')
     
     # 2. Mock Gate Heatmap
     print("Generating mock Gate Heatmap...")

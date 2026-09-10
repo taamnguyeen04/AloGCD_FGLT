@@ -111,7 +111,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             compute_margin_confidence, compute_target_capacity,
             compute_dist_adaptive_gate_loss, compute_gate_reg_loss,
         )
-        d = args.feat_dim  # 768 for ViT-B/16
+        d = args.feat_dim  # 768 for ViT-B (v1 /16 or v2 /14)
         M = args.num_slots
         C = args.num_classes
 
@@ -123,8 +123,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         optimizer_part = SGD(part_module.parameters(), lr=0.05, momentum=0.9, weight_decay=1e-4)
         optimizer_gate = SGD([part_bank.gate_logits], lr=0.01, momentum=0.9)
         # Cho part loss update trực tiếp backbone nó đang đứng (fix dead-gradient)
+        from model.backbone import is_late_block_param
         cl_late_params = [p for n, p in cl_backbone.named_parameters()
-                          if ('block.11' in n or 'norm' in n) and p.requires_grad]
+                          if (is_late_block_param(n, 11) or 'norm' in n) and p.requires_grad]
         if len(cl_late_params) > 0:
             optimizer_part.add_param_group({'params': cl_late_params, 'lr': 0.01})
         scheduler_part = lr_scheduler.CosineAnnealingLR(
@@ -164,6 +165,22 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         args.logger.info("\n[PSEUDO LABELING] Enabled - Mode {mode}".format(mode=args.pseudo_mode))
         args.logger.info("[PSEUDO LABELING] Original labeled distribution: {}".format(
             dict(sorted(orig_labeled_counts.items()))))
+        # Novel-door (D2) state: cong tac --enable-novel-pseudo. Tat = known-only nhu cu.
+        args._novel_iteration = 0
+        args._novel_dim_members = {}  # dim -> set(uq) accepted last novel iter (no-remap guard)
+        args._novel_prev_dbi = None   # DBI cau dao: te hon >5% -> skip iter
+        if getattr(args, 'enable_novel_pseudo', False):
+            args.logger.info("[NOVEL-PSEUDO] Enabled - warmup {w}, freq {f}, max_iters {m}, "
+                             "cap/dim {c}, jaccard>={j}, agree>={a}, min_size {s}".format(
+                                 w=getattr(args, 'novel_warmup_epoch', 50),
+                                 f=getattr(args, 'novel_update_freq', 10),
+                                 m=getattr(args, 'max_novel_iterations', 2),
+                                 c=getattr(args, 'novel_max_samples', 100),
+                                 j=getattr(args, 'novel_jaccard_th', 0.6),
+                                 a=getattr(args, 'novel_agree_th', 0.7),
+                                 s=getattr(args, 'novel_min_size', 10)))
+        else:
+            args.logger.info("[NOVEL-PSEUDO] Disabled - known-only selection (D1).")
     cluster_criterion = DistillLoss(
         args.warmup_teacher_temp_epochs,
         args.epochs,
@@ -190,25 +207,21 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             class_labels, mask_lab = class_labels.cuda(non_blocking=True), mask_lab.cuda(non_blocking=True).bool()
             images = torch.cat(images_, dim=0).cuda(non_blocking=True)
 
-            x = ce_backbone.prepare_tokens(images)
+            from model.backbone import (forward_blocks_from,
+                                             forward_frozen_prefix,
+                                             split_cls_patches)
+            # Frozen prefix (blocks < grad_from_block) shared by both branches
+            # (identical init + frozen, saves compute). Works for DINOv1/v2.
+            x = forward_frozen_prefix(ce_backbone, images, args.grad_from_block)
 
-            for i, blk in enumerate(ce_backbone.blocks):
-                if i < args.grad_from_block:
-                    x = blk(x)   # get fixed feature
-
-            for i, blk in enumerate(ce_backbone.blocks):
-                if i >= args.grad_from_block:
-                    ce_backbone_feature = blk(x)
-            ce_backbone_feature = ce_backbone.norm(ce_backbone_feature)
-            ce_backbone_feature = ce_backbone_feature[:, 0]
+            ce_out = forward_blocks_from(x, ce_backbone, args.grad_from_block)
+            ce_out = ce_backbone.norm(ce_out)
+            ce_backbone_feature, _ = split_cls_patches(ce_out, ce_backbone)
             student_out = ce_head(ce_backbone_feature)
 
-            for i, blk in enumerate(cl_backbone.blocks):
-                if i >= args.grad_from_block:
-                    cl_backbone_feature = blk(x)
-            cl_full = cl_backbone.norm(cl_backbone_feature)
-            cl_backbone_feature = cl_full[:, 0]
-            cl_patch_tokens = cl_full[:, 1:]
+            cl_out = forward_blocks_from(x, cl_backbone, args.grad_from_block)
+            cl_full = cl_backbone.norm(cl_out)
+            cl_backbone_feature, cl_patch_tokens = split_cls_patches(cl_full, cl_backbone)
             cl_proj_feature = cl_head(cl_backbone_feature)
 
             ####################### COMPUTE LOSS #######################
@@ -276,7 +289,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
                         # Distribution-adaptive gating
                         if not args.ablate_adaptive_capacity and est_count is not None:
-                            pi_hat = torch.tensor(est_count, dtype=torch.float, device=device)
+                            pi_hat = est_count.detach().clone().float().to(device)
                             M_target = compute_target_capacity(pi_hat, args.num_slots)
                             loss_dist = compute_dist_adaptive_gate_loss(a, M_target)
                             loss_ce = loss_ce + 0.05 * loss_dist
@@ -380,7 +393,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         if epoch % args.test_freq == 0:
             args.logger.info('Testing on disjoint test set...')
             with torch.no_grad():
-                all_acc_test_cl, old_acc_test_cl, new_acc_test_cl, acc_list_cl, cl_ind_map = test(
+                (all_acc_test_cl, old_acc_test_cl, new_acc_test_cl,
+                 acc_list_cl, cl_ind_map, _, _) = test(
                     student_cl,
                     test_loader,
                     epoch=epoch,
@@ -443,34 +457,89 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     args.logger.info(f"[MODE 1-CachA] Best train class: {best_class} (train-acc: {best_acc:.3f})")
                     target_class = best_class
                 elif args.pseudo_mode == 3:
-                    # Cach B: best unsupervised conf tren train-unlabeled, khong can GT nao.
-                    best_class, scores, details = compute_unsupervised_class_scores(
-                        student_ce, unlab_loader, args.num_labeled_classes)
-                    d = details[best_class]
-                    args.logger.info(f"[MODE 3-CachB] Best conf class: {best_class} "
-                                     f"(mean_conf: {d['mean_conf']:.3f}, n: {d['n']}, n_hi09: {d['n_hi09']})")
-                    target_class = best_class
+                    # Cach B: class co NHIEU mau high-conf nhat (khong can GT nao).
+                    # Tra None khi khong class nao qua san -> SKIP iteration (khong bom rac).
+                    bar = _resolve_conf_bar(args)
+                    best_class, scores, details, cstats = compute_unsupervised_class_scores(
+                        student_ce, unlab_loader, args.num_labeled_classes,
+                        min_count=50,
+                        conf_bar=bar,
+                        min_hi=getattr(args, 'pseudo_min_hi', 10))
+                    args.logger.info(f"[MODE 3-CachB] Unlabeled conf dist: "
+                                     f"p50={cstats['p50']:.3f} p90={cstats['p90']:.3f} max={cstats['max']:.3f} "
+                                     f"(bar={bar:.4f} = k/C, k={getattr(args, 'pseudo_bar_k', 2.0)})")
+                    if best_class is None:
+                        args.logger.info("[MODE 3-CachB] SKIP iteration: no class has "
+                                         f">={getattr(args, 'pseudo_min_hi', 10)} samples "
+                                         f"above bar — model not confident enough yet.")
+                        target_class = None
+                        args._mode3_skip = True
+                    else:
+                        d = details[best_class]
+                        args.logger.info(f"[MODE 3-CachB] Best count class: {best_class} "
+                                         f"(n_hi: {d['n_hi']}, n: {d['n']}, "
+                                         f"mean_conf: {d['mean_conf']:.3f})")
+                        target_class = best_class
+                        args._mode3_skip = False
+                elif args.pseudo_mode == 0:
+                    # Cua known TAT: chi novel (ablation sach). Khong chon, khong audit D1.
+                    target_class = None
+                    args.logger.info(f"[MODE 0] Known door OFF — novel-only run.")
                 else:
                     target_class = None
                     args.logger.info(f"[MODE 2] High confidence threshold across all classes: {args.confidence_threshold}")
-                
-                # Collect pseudo labels
-                new_pseudo, newly_used = collect_pseudo_labels_from_unlabeled(
-                    student_ce, unlab_loader,
-                    mode=args.pseudo_mode,
-                    target_class=target_class,
-                    max_samples=args.max_samples_per_class,
-                    threshold=getattr(args, 'confidence_threshold', 0.9),
-                    used_uq_idxs=used_pseudo_uq_idxs,
-                    top_ratio=getattr(args, 'pseudo_top_ratio', 0.8),
-                    max_label=args.num_labeled_classes if args.pseudo_mode == 2 else None
-                )
+
+                # Collect pseudo labels (Mode 3 skip / Mode 0 -> empty, khong bom rac)
+                if args.pseudo_mode == 0 or \
+                        (args.pseudo_mode == 3 and getattr(args, '_mode3_skip', False)):
+                    new_pseudo, newly_used = [], set()
+                else:
+                    new_pseudo, newly_used = collect_pseudo_labels_from_unlabeled(
+                        student_ce, unlab_loader,
+                        mode=args.pseudo_mode,
+                        target_class=target_class,
+                        max_samples=args.max_samples_per_class,
+                        threshold=getattr(args, 'confidence_threshold', 0.9),
+                        used_uq_idxs=used_pseudo_uq_idxs,
+                        top_ratio=getattr(args, 'pseudo_top_ratio', 0.8),
+                        max_label=args.num_labeled_classes if args.pseudo_mode == 2 else None
+                    )
                 used_pseudo_uq_idxs |= newly_used
 
-                if args.pseudo_mode in (1, 3):
+                if args.pseudo_mode == 0:
+                    args.logger.info(f"[MODE 0] Known door OFF — skipping known collection.")
+                elif args.pseudo_mode in (1, 3):
                     args.logger.info(f"Collected {len(new_pseudo)} pseudo samples for class {target_class}")
                 else:
                     args.logger.info(f"Collected {len(new_pseudo)} pseudo samples across classes (th>={getattr(args, 'confidence_threshold', 0.9)})")
+
+                # ---- Novel door (D2): 1 co duy nhat --enable-novel-pseudo ----
+                # Chay SAU cua known, chung used-set (anh known-da-lay thi novel bo qua).
+                # Merge vao new_pseudo -> 1 audit + 1 loader update duy nhat.
+                new_novel_pseudo = []
+                if getattr(args, 'enable_novel_pseudo', False):
+                    n_warm = getattr(args, 'novel_warmup_epoch', 50)
+                    n_freq = getattr(args, 'novel_update_freq', 10)
+                    n_max = getattr(args, 'max_novel_iterations', 2)
+                    args._novel_iteration = getattr(args, '_novel_iteration', 0)
+                    if epoch >= n_warm and ((epoch - n_warm) % n_freq == 0) \
+                            and args._novel_iteration < n_max:
+                        args._novel_iteration += 1
+                        args.logger.info(f"[NOVEL-PSEUDO] Iteration {args._novel_iteration} "
+                                         f"(epoch {epoch})")
+                        new_novel_pseudo = collect_novel_pseudo_from_unlabeled(
+                            student_ce, cl_backbone, unlab_loader,
+                            train_loader, args,
+                            used_uq_idxs=used_pseudo_uq_idxs)
+                        used_pseudo_uq_idxs |= {s['uq_idx'] for s in new_novel_pseudo}
+                    else:
+                        args.logger.info(f"[NOVEL-PSEUDO] Skipped (epoch {epoch}: "
+                                         f"warmup={n_warm} freq={n_freq} "
+                                         f"done={args._novel_iteration}/{n_max})")
+                if new_novel_pseudo:
+                    args.logger.info(f"Collected {len(new_novel_pseudo)} NOVEL pseudo samples "
+                                     f"(+{len(new_pseudo)} known = {len(new_pseudo) + len(new_novel_pseudo)} total)")
+                    new_pseudo = new_pseudo + new_novel_pseudo
 
                 # ---------------------------------------------------------
                 # GROUND-TRUTH AUDIT of the selected pseudo samples.
@@ -500,7 +569,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                         'iteration': pseudo_iteration,
                         'epoch': epoch,
                         'n_selected': len(new_pseudo),
-                        **audit,   # n_true_correct / n_wrong_old / n_novel_contamination
+                        **audit,   # d1 keys + d2 keys (n_novel_correct / n_known_leakage / ...)
                         'pseudo_samples_total': pseudo_samples_added,
                         **{f'labeled_c{c}': labeled_class_counts.get(c, 0)
                            for c in sorted(set(orig_labeled_counts) | set(labeled_class_counts))},
@@ -533,6 +602,13 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 'ce_head': ce_head.state_dict(),
                 'cl_backbone': cl_backbone.state_dict(),
                 'cl_head': cl_head.state_dict(),
+                # AdaPart states (None when --use-parts off). Old checkpoints
+                # lack these keys — loaders must use ckpt.get(), never ckpt[].
+                'part_module': (part_module.state_dict()
+                                if part_module is not None else None),
+                'part_bank': (part_bank.state_dict()
+                              if part_bank is not None else None),
+                'args_backbone': getattr(args, 'backbone', 'unknown'),
             }
 
             torch.save(save_dict_cl, save_path + f'/model_epoch{epoch}.pt')
@@ -556,6 +632,17 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             ce_head.load_state_dict(ckpt['ce_head'])
             cl_backbone.load_state_dict(ckpt['cl_backbone'])
             cl_head.load_state_dict(ckpt['cl_head'])
+            # Restore AdaPart states when present (missing in pre-5.3.0
+            # checkpoints — .get() keeps those loadable for backbone eval).
+            try:
+                if part_module is not None and ckpt.get('part_module') is not None:
+                    part_module.load_state_dict(ckpt['part_module'])
+                    args.logger.info('[FINAL EVAL] Restored part_module from checkpoint.')
+                if part_bank is not None and ckpt.get('part_bank') is not None:
+                    part_bank.load_state_dict(ckpt['part_bank'])
+                    args.logger.info('[FINAL EVAL] Restored part_bank from checkpoint.')
+            except Exception as e:
+                args.logger.warning(f'[FINAL EVAL] Part restore skipped: {e}')
             del ckpt
 
             student_cl = nn.Sequential(cl_backbone, cl_head)
@@ -563,7 +650,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             # Always visualize the final best model regardless of vis_freq phase
             saved_vis_freq = args.vis_freq
             args.vis_freq = 1
-            all_acc, old_acc, new_acc, acc_list, ind_map = test(
+            (all_acc, old_acc, new_acc, acc_list,
+             ind_map, nmi, ari) = test(
                 student_cl, test_loader, epoch=best_epoch,
                 save_name='Final ACC', args=args, train_loader=train_loader)
             args.vis_freq = saved_vis_freq
@@ -574,10 +662,13 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 'k_std': np.array(acc_list[:3]).std(),
                 'u_many': acc_list[3], 'u_med': acc_list[4], 'u_few': acc_list[5],
                 'u_std': np.array(acc_list[3:6]).std(),
+                'nmi': nmi, 'ari': ari,
             }
             from util.visualize_utils import save_final_report
             save_final_report(accs, args, extra_info={
                 'dataset': args.dataset_name,
+                'backbone': getattr(args, 'backbone', 'unknown'),
+                'train_seed': getattr(args, 'train_seed', 'unknown'),
                 'imb_ratio': args.imb_ratio,
                 'epochs': args.epochs,
                 'best_epoch': best_epoch,
@@ -613,12 +704,9 @@ def test(model, test_loader, epoch, save_name, args, train_loader):
                 and not getattr(args, 'ablate_concat_eval', False)
                 and getattr(args, '_part_module_ref', None) is not None):
             with torch.no_grad():
+                from model.backbone import forward_backbone_tokens
                 backbone = model[0]
-                x = backbone.prepare_tokens(images)
-                for i, blk in enumerate(backbone.blocks):
-                    x = blk(x)
-                x = backbone.norm(x)
-                patch_tokens = x[:, 1:]
+                _, patch_tokens, x = forward_backbone_tokens(backbone, images)
                 r_norm, _ = args._part_module_ref(patch_tokens)
                 bank = getattr(args, '_part_bank_ref', None)
                 if bank is not None:
@@ -647,9 +735,10 @@ def test(model, test_loader, epoch, save_name, args, train_loader):
     preds = kmeans.labels_
     print('Done!')
 
-    all_acc, old_acc, new_acc, acc_list, ind_map = log_accs_from_preds(y_true=targets, y_pred=preds, mask=mask,
-                                                    T=epoch, eval_funcs=args.eval_funcs, save_name=save_name,
-                                                    args=args, train_loader=train_loader)
+    (all_acc, old_acc, new_acc, acc_list,
+     ind_map, nmi, ari) = log_accs_from_preds(y_true=targets, y_pred=preds, mask=mask,
+                                              T=epoch, eval_funcs=args.eval_funcs, save_name=save_name,
+                                              args=args, train_loader=train_loader)
 
     # PCA / t-SNE / confusion matrix — reuse features & preds already computed
     vis_freq = getattr(args, 'vis_freq', 1)
@@ -664,7 +753,7 @@ def test(model, test_loader, epoch, save_name, args, train_loader):
             args=args,
             save_name=save_name)
 
-    return all_acc, old_acc, new_acc, acc_list, ind_map
+    return all_acc, old_acc, new_acc, acc_list, ind_map, nmi, ari
 
 
 # ============================================================================
@@ -804,17 +893,54 @@ def evaluate_train_labeled_per_class_accuracy(model, labelled_loader, num_labele
     return stats
 
 
-def compute_unsupervised_class_scores(model, unlab_loader, num_labeled, device='cuda', min_count=50):
+def _resolve_conf_bar(args, default=0.5):
+    """Vach voi tuong doi theo so class: bar = k / C.
+
+    Doan bua duoc 1/C, thi 'tu tin that' nen gap vai lan muc do.
+    --pseudo-bar-k > 0 (default 5): bar = k / num_classes (CUB-200 -> 0.025,
+    CIFAR-100 -> 0.05, CIFAR-10 -> 0.5 = trung so cu).
+    --pseudo-bar-k <= 0: dung --pseudo-conf-bar tuyet doi (default 0.5).
+    """
+    try:
+        k = float(getattr(args, 'pseudo_bar_k', 2.0))
+    except Exception:
+        k = 2.0
+    if k > 0:
+        try:
+            nc = int(getattr(args, 'num_classes', 0) or 0)
+        except Exception:
+            nc = 0
+        if nc > 0:
+            return k / nc
+    try:
+        return float(getattr(args, 'pseudo_conf_bar', default))
+    except Exception:
+        return default
+
+
+def compute_unsupervised_class_scores(model, unlab_loader, num_labeled, device='cuda', min_count=50,
+                                        conf_bar=0.5, min_hi=10):
     """Cach B (Mode 3): chon best class bang confidence tren TRAIN-UNLABELED, khong can GT nao.
 
-    Voi moi predicted old class c: mean max-softmax + high-conf count.
-    best = argmax mean_conf trong so cac class co du min_count mau.
-    Returns (best_class, scores, details).
+    Quy tac (fix 2026-09: truoc day xep theo mean max-softmax + fallback tu go rao,
+    tren 200-way chon phai class mean_conf ~0.01 gan nhu random):
+      1. Moi predicted old class c: dem n_hi = so mau co conf >= conf_bar.
+      2. Eligible: n_hi >= min_hi. KHONG fallback — khong class nao qua thi tra
+         best_class=None de caller SKIP iteration (that trung thuc hon bom rac).
+      3. Xep hang: n_hi desc, tiebreak mean_conf desc (tranh head-bias thuan tuy
+         cua count: class dong nhung conf le te khong tu dong thang neu co class
+         it mau hon nhung conf cao hon? Khong — count van uu tien truoc; tiebreak
+         chi xu ly hoa. Muon chong head-bias manh hon thi tang conf_bar.)
+    Returns (best_class_or_None, scores, details, conf_stats) trong do
+      scores[c] = n_hi (so mau high-conf, dung de rank),
+      details[c] = {'n','mean_conf','n_hi09','n_hi'} (giu key cu cho compat),
+      conf_stats = {'p50','p90','max'} cua max-conf toan unlabeled (de calibrate bar).
     """
     import torch.nn.functional as F
 
     model.eval()
     conf_lists = {c: [] for c in range(num_labeled)}
+    all_confs = []
     with torch.no_grad():
         for batch in unlab_loader:
             images = batch[0]
@@ -829,19 +955,31 @@ def compute_unsupervised_class_scores(model, unlab_loader, num_labeled, device='
             confs, preds = probs.max(dim=1)
             for p, c in zip(preds, confs):
                 p = int(p.item())
+                cf = float(c.item())
+                all_confs.append(cf)
                 if 0 <= p < num_labeled:
-                    conf_lists[p].append(float(c.item()))
+                    conf_lists[p].append(cf)
+    import numpy as _np
+    if all_confs:
+        _a = _np.array(all_confs)
+        conf_stats = {'p50': float(_np.percentile(_a, 50)),
+                      'p90': float(_np.percentile(_a, 90)),
+                      'max': float(_a.max())}
+    else:
+        conf_stats = {'p50': 0.0, 'p90': 0.0, 'max': 0.0}
     scores, details = {}, {}
     for c, lst in conf_lists.items():
         n = len(lst)
         mean_c = sum(lst) / n if n > 0 else 0.0
-        hi = sum(1 for v in lst if v >= 0.9)
-        scores[c] = mean_c
-        details[c] = {'n': n, 'mean_conf': mean_c, 'n_hi09': hi}
-    eligible = {c: s for c, s in scores.items() if details[c]['n'] >= min_count}
-    pool = eligible if eligible else scores
-    best_class = max(pool.keys(), key=lambda c: pool[c])
-    return best_class, scores, details
+        hi = sum(1 for v in lst if v >= conf_bar)
+        hi09 = sum(1 for v in lst if v >= 0.9)
+        scores[c] = hi
+        details[c] = {'n': n, 'mean_conf': mean_c, 'n_hi09': hi09, 'n_hi': hi}
+    eligible = [c for c in scores if details[c]['n_hi'] >= min_hi]
+    if not eligible:
+        return None, scores, details, conf_stats
+    best_class = max(eligible, key=lambda c: (scores[c], details[c]['mean_conf']))
+    return best_class, scores, details, conf_stats
 
 
 def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_class, max_samples, threshold,
@@ -917,6 +1055,217 @@ def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_c
 
     new_used = {s['uq_idx'] for s in selected}
     return selected, new_used
+
+
+def _first_view(images):
+    """Unwrap ContrastiveLearningViewGenerator output (list of views -> view 0)."""
+    if isinstance(images, (list, tuple)):
+        return images[0]
+    return images
+
+
+def _infer_device(module):
+    try:
+        return str(next(module.parameters()).device)
+    except Exception:
+        return 'cpu'
+
+
+def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
+                                       train_loader, args, used_uq_idxs=None):
+    """Novel-door (D2) pseudo-labeling: cluster-anchored consensus. Never raises.
+
+    Pipeline moi pseudo iteration:
+      1. Forward 1 pass tren unlabeled: CL-feature (de cluster) + CE-logit (de gán).
+      2. KMeans x2 seeds (fit tren subsample ≤15000, assign full) tren CL-feature.
+      3. Align bang LABELED: gan labeled vao centroid gan nhat -> Hungarian ->
+         cluster map vao known thi bo, cluster thua (leftover) = ung vien novel.
+      4. 3 gates consensus cho moi cum leftover: (i) stability Jaccard vs run seed
+         khac (so tap uq_idx, KHONG so cluster ID); (ii) silhouette TB >= median;
+         (iii) agreement: ti le CE-pred cung 1 novel dim >= nguong. + size guard.
+      5. Cau dao DBI: DBI te hon iter truoc >5% -> skip iter nay.
+      6. No-remap: cum map vao dim D nhung dan so dao lon vs iter truoc -> drop.
+      7. Cap moi dim, uu tien CE-confidence cao, bo uq da dung (chung set voi cua known).
+
+    Tra ve list sample cung schema {'image','label','confidence','uq_idx'} de tai
+    dung update_train_loader. Bat ky loi gi -> warning + [] (khong crash train).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import davies_bouldin_score, silhouette_samples
+        from scipy.optimize import linear_sum_assignment as linear_assignment
+    except Exception as e:
+        args.logger.warning(f"[NOVEL-PSEUDO] sklearn/scipy missing ({e}) — skipping.")
+        return []
+
+    try:
+        import numpy as np
+        device = _infer_device(cl_backbone)
+        NL = int(args.num_labeled_classes)
+        K = int(args.num_classes)
+        j_th = float(getattr(args, 'novel_jaccard_th', 0.6))
+        a_th = float(getattr(args, 'novel_agree_th', 0.7))
+        min_size = int(getattr(args, 'novel_min_size', 10))
+        cap = int(getattr(args, 'novel_max_samples', 100))
+        # used-set CHUNG voi cua known (caller truyen used_pseudo_uq_idxs sau khi
+        # cua known da lay phan cua no) -> 1 anh khong bao gio vao ca 2 cua.
+        used_uq = used_uq_idxs if used_uq_idxs is not None else set()
+
+        # NOTE: eval() without restore mirrors collect_pseudo_labels_from_unlabeled
+        # (known door) on purpose — C2 vs C3 ablation stays unconfounded.
+        # Harmless here: ViT/DINO heads use LayerNorm + zero dropout rates.
+        student_ce.eval()
+        cl_backbone.eval()
+
+        # ---- 1. Single fused pass: CL feats + CE logits ----
+        U_feats, U_pred, U_conf, U_uq, U_imgs = [], [], [], [], []
+        with torch.no_grad():
+            for batch in unlab_loader:
+                images = _first_view(batch[0]).to(device)
+                uq = batch[2]
+                cf = F.normalize(cl_backbone(images), dim=-1)
+                ce_f = F.normalize(student_ce[0](images), dim=-1)
+                logits = student_ce[1](ce_f)
+                probs = F.softmax(logits, dim=1)
+                conf, pred = probs.max(dim=1)
+                U_feats.append(cf.cpu())
+                U_pred.append(pred.cpu())
+                U_conf.append(conf.cpu())
+                U_uq.extend([int(x) for x in uq])
+                U_imgs.extend([im.cpu() for im in _first_view(batch[0])])
+        U_feats = torch.cat(U_feats).numpy()
+        U_pred = torch.cat(U_pred).numpy().astype(int)
+        U_conf = torch.cat(U_conf).numpy()
+        U_uq = np.array(U_uq)
+        N = len(U_feats)
+
+        # ---- 2. KMeans x2 seeds (fit subsample, assign full) ----
+        rng = np.random.RandomState(getattr(args, '_novel_iteration', 0) + 12345)
+        fit_idx = rng.choice(N, size=min(N, 15000), replace=False)
+        km0 = KMeans(n_clusters=K, random_state=0, n_init=10).fit(U_feats[fit_idx])
+        km1 = KMeans(n_clusters=K, random_state=1, n_init=10).fit(U_feats[fit_idx])
+        cent0 = km0.cluster_centers_
+        d0 = ((U_feats[:, None, :] - cent0[None, :, :]) ** 2).sum(-1)
+        lab0 = d0.argmin(axis=1)
+        d1 = ((U_feats[:, None, :] - km1.cluster_centers_[None, :, :]) ** 2).sum(-1)
+        lab1 = d1.argmin(axis=1)
+
+        # ---- 3. Align via LABELED nearest-centroid + Hungarian ----
+        from torch.utils.data import DataLoader
+        lab_loader = DataLoader(train_loader.dataset.labelled_dataset,
+                                batch_size=256, shuffle=False, num_workers=0)
+        L_feats, L_true = [], []
+        with torch.no_grad():
+            for batch in lab_loader:
+                images = _first_view(batch[0]).to(device)
+                labels = batch[1]
+                if not torch.is_tensor(labels):
+                    labels = torch.tensor(labels)
+                f = F.normalize(cl_backbone(images), dim=-1)
+                L_feats.append(f.cpu())
+                L_true.extend([int(x) for x in labels])
+        L_feats = torch.cat(L_feats).numpy()
+        L_true = np.array(L_true)
+        L_assign = ((L_feats[:, None, :] - cent0[None, :, :]) ** 2).sum(-1).argmin(axis=1)
+        w = np.zeros((K, NL), dtype=int)
+        for c, t in zip(L_assign, L_true):
+            if 0 <= t < NL:
+                w[c, t] += 1
+        rows, _ = linear_assignment(w.max() - w)
+        known_clusters = set(int(r) for r in rows)
+        leftover = [c for c in range(K) if c not in known_clusters]
+
+        # ---- 4a. Stability (Jaccard on uq member sets, both runs) ----
+        mem0 = {c: set(U_uq[lab0 == c].tolist()) for c in range(K)}
+        mem1 = {c: set(U_uq[lab1 == c].tolist()) for c in range(K)}
+
+        def _jacc(a, b):
+            u = len(a | b)
+            return len(a & b) / u if u > 0 else 0.0
+
+        # ---- 4b. Silhouette on subsample (<=2000) + DBI gate ----
+        sub_idx = rng.choice(N, size=min(N, 2000), replace=False)
+        sil = silhouette_samples(U_feats[sub_idx], lab0[sub_idx])
+        sil_mean = {}
+        for c in range(K):
+            m = lab0[sub_idx] == c
+            sil_mean[c] = float(sil[m].mean()) if m.any() else -1.0
+        sil_med = float(np.median(list(sil_mean.values())))
+        dbi = float(davies_bouldin_score(U_feats[sub_idx], lab0[sub_idx]))
+        prev_dbi = getattr(args, '_novel_prev_dbi', None)
+        if prev_dbi is not None and dbi > prev_dbi * 1.05:
+            args.logger.info(f"[NOVEL-PSEUDO] DBI {dbi:.3f} worse than prev {prev_dbi:.3f} "
+                             f"(>5%) — skipping novel inject this iter.")
+            return []
+        args._novel_prev_dbi = dbi
+
+        # ---- 4c/5/6. Gates + mapping + no-remap + cap ----
+        dim_members = getattr(args, '_novel_dim_members', None)
+        if dim_members is None:
+            dim_members = {}
+            args._novel_dim_members = dim_members
+        selected = []
+        gate_rows = []
+        for c in leftover:
+            members = np.where(lab0 == c)[0]
+            size = len(members)
+            stab = max((_jacc(mem0[c], mem1[b]) for b in range(K)), default=0.0)
+            s_mean = sil_mean.get(c, -1.0)
+            mpred = U_pred[members] if size else np.array([], dtype=int)
+            novel_mask = mpred >= NL
+            if novel_mask.sum() == 0:
+                gate_rows.append((c, size, stab, s_mean, '-', 0.0, 'drop:no-novel-pred'))
+                continue
+            vals, counts = np.unique(mpred[novel_mask], return_counts=True)
+            top_dim = int(vals[counts.argmax()])
+            agree = float(counts.max() / size)
+            reason = 'keep'
+            if size < min_size:
+                reason = f'drop:size<{min_size}'
+            elif stab < j_th:
+                reason = f'drop:stab<{j_th}'
+            elif s_mean < sil_med:
+                reason = 'drop:sil<median'
+            elif agree < a_th:
+                reason = f'drop:agree<{a_th}'
+            else:
+                prev_set = dim_members.get(top_dim, set())
+                if prev_set and _jacc(set(U_uq[members].tolist()), prev_set) < 0.3:
+                    reason = 'drop:remap-flip'
+            gate_rows.append((c, size, stab, s_mean, top_dim, agree, reason))
+            if reason != 'keep':
+                continue
+            # rank members by CE confidence, skip used, cap per dim
+            order = members[np.argsort(-U_conf[members])]
+            kept = 0
+            new_member_uqs = set()
+            for idx in order:
+                if kept >= cap:
+                    break
+                uq = int(U_uq[idx])
+                if uq in used_uq:
+                    continue
+                used_uq.add(uq)
+                new_member_uqs.add(uq)
+                selected.append({'image': U_imgs[idx], 'label': top_dim,
+                                 'confidence': float(U_conf[idx]), 'uq_idx': uq})
+                kept += 1
+            dim_members[top_dim] = new_member_uqs
+
+        args.logger.info(f"[NOVEL-PSEUDO] K={K} leftover={len(leftover)} "
+                         f"sil_med={sil_med:.3f} dbi={dbi:.3f} -> selected {len(selected)}")
+        for (c, size, stab, s_mean, td, agree, reason) in gate_rows:
+            args.logger.info(f"  cluster {c:>3}: n={size:5d} stab={stab:.2f} "
+                             f"sil={s_mean:+.2f} dim={td} agree={agree:.2f} {reason}")
+        return selected
+    except Exception as e:
+        import traceback
+        args.logger.warning(f"[NOVEL-PSEUDO] Failed (non-fatal, known-door unaffected): {e}")
+        args.logger.warning(traceback.format_exc(limit=5))
+        return []
 
 
 def create_pseudo_dataset(pseudo_samples):
@@ -1068,63 +1417,194 @@ def count_pseudo_into(class_counts, pseudo_samples):
 
 
 def audit_pseudo_samples(pseudo_samples, uq2true, num_labeled):
-    """Classify each selected pseudo sample against its true label.
+    """Classify each selected pseudo sample against its true label, both doors.
 
-    Returns counts:
-      n_true_correct         — pseudo label == true old-class label
-      n_wrong_old            — truly another OLD class (confirmation-bias fuel)
-      n_novel_contamination  — truly a NOVEL class mislabeled as old (novel swallowing)
-      novel_true_labels      — Counter {true novel class: n} (which classes got eaten)
+    Pseudo-labels are already class IDs (head dims), so no Hungarian is needed —
+    this is a direct comparison. Samples split by which door they were selected for:
+      Direction 1 (known door, label < num_labeled) — existing keys, unchanged:
+        n_true_correct         — pseudo label == true old-class label
+        n_wrong_old            — truly another OLD class (confirmation-bias fuel)
+        n_novel_contamination  — truly a NOVEL class mislabeled as old (novel swallowing)
+        novel_true_labels      — Counter {true novel class: n} (which classes got eaten)
+      Direction 2 (novel door, label >= num_labeled) — new keys (0 when
+      known-only modes run, so old logs stay comparable):
+        n_novel_correct        — pseudo novel dim == true novel label
+        n_known_leakage        — truly a KNOWN class mislabeled as novel (reverse leak;
+                                 pollutes both sides: known loses samples, novel gets noise)
+        n_novel_confused       — truly another NOVEL class (novel-vs-novel mixup)
+        known_leak_sources     — Counter {true known class: n} (which known classes leak out)
+        novel_confused_true    — Counter {true novel class: n} (which novel classes get mixed)
+      n_selected_d1 / n_selected_d2 — per-door sample counts.
     """
     from collections import Counter
     n_true_correct = n_wrong_old = n_novel = 0
     novel_true_labels = Counter()
+    n_novel_correct = n_known_leak = n_novel_conf = 0
+    known_leak_sources = Counter()
+    novel_confused_true = Counter()
+    n_d1 = n_d2 = 0
     for s in pseudo_samples:
         true_lbl = uq2true.get(int(s['uq_idx']))
         if true_lbl is None:
             continue
-        if true_lbl < num_labeled:
-            if true_lbl == int(s['label']):
-                n_true_correct += 1
+        pseudo_lbl = int(s['label'])
+        if pseudo_lbl < num_labeled:
+            # ---- Direction 1: selected as known ----
+            n_d1 += 1
+            if true_lbl < num_labeled:
+                if true_lbl == pseudo_lbl:
+                    n_true_correct += 1
+                else:
+                    n_wrong_old += 1
             else:
-                n_wrong_old += 1
+                n_novel += 1
+                novel_true_labels[true_lbl] += 1
         else:
-            n_novel += 1
-            novel_true_labels[true_lbl] += 1
+            # ---- Direction 2: selected as novel ----
+            n_d2 += 1
+            if true_lbl >= num_labeled:
+                if true_lbl == pseudo_lbl:
+                    n_novel_correct += 1
+                else:
+                    n_novel_conf += 1
+                    novel_confused_true[true_lbl] += 1
+            else:
+                n_known_leak += 1
+                known_leak_sources[true_lbl] += 1
     return {
         'n_selected_gt': len(pseudo_samples),
+        'n_selected_d1': n_d1,
+        'n_selected_d2': n_d2,
         'n_true_correct': n_true_correct,
         'n_wrong_old': n_wrong_old,
         'n_novel_contamination': n_novel,
         'novel_true_labels': dict(novel_true_labels),
+        'n_novel_correct': n_novel_correct,
+        'n_known_leakage': n_known_leak,
+        'n_novel_confused': n_novel_conf,
+        'known_leak_sources': dict(known_leak_sources),
+        'novel_confused_true': dict(novel_confused_true),
     }
 
 
+def _pct(n, d):
+    return 100.0 * n / d if d > 0 else 0.0
+
+
+def _top(counter_dict, k=5):
+    """Top-k {class: n} entries sorted by count desc, for evidence logs."""
+    return dict(sorted(counter_dict.items(), key=lambda kv: kv[1], reverse=True)[:k])
+
+
 def log_pseudo_audit(audit, pseudo_iteration, target_class, args):
-    """Print the audit verdict for one pseudo-labeling iteration."""
+    """Print the 2-door audit verdict for one pseudo-labeling iteration.
+
+    Direction 1 (known door) keeps the exact legacy format so old logs stay
+    comparable. Direction 2 (novel door) prints only when novel pseudo samples
+    exist. Ends with a cumulative evidence table over all iterations so far
+    (history from args.pseudo_events + current audit).
+    """
     sel = audit['n_selected_gt']
     if sel == 0:
         args.logger.info(f"[PSEUDO AUDIT iter {pseudo_iteration}] No samples selected — nothing to audit.")
         return
-
-    pct_ok = 100.0 * audit['n_true_correct'] / sel
-    pct_wrong_old = 100.0 * audit['n_wrong_old'] / sel
-    pct_novel = 100.0 * audit['n_novel_contamination'] / sel
+    d1 = audit.get('n_selected_d1', sel)
+    d2 = audit.get('n_selected_d2', 0)
 
     args.logger.info("\n" + "-" * 60)
     args.logger.info(f"[PSEUDO AUDIT iter {pseudo_iteration}] Ground-truth check of selected pseudo labels"
                      + (f" (target class {target_class})" if target_class is not None else ""))
-    args.logger.info(f"  Correct (old==old):        {audit['n_true_correct']:4d}/{sel} = {pct_ok:5.1f}%")
-    args.logger.info(f"  WRONG OLD class:           {audit['n_wrong_old']:4d}/{sel} = {pct_wrong_old:5.1f}%")
-    args.logger.info(f"  NOVEL class swallowed:     {audit['n_novel_contamination']:4d}/{sel} = {pct_novel:5.1f}%")
+
+    # ---- Direction 1: known door (legacy format, unchanged) ----
+    pct_ok = _pct(audit['n_true_correct'], d1)
+    pct_wrong_old = _pct(audit['n_wrong_old'], d1)
+    pct_novel = _pct(audit['n_novel_contamination'], d1)
+    args.logger.info(f"  [D1 known door] n={d1}")
+    args.logger.info(f"    Correct (old==old):        {audit['n_true_correct']:4d}/{d1} = {pct_ok:5.1f}%")
+    args.logger.info(f"    WRONG OLD class:           {audit['n_wrong_old']:4d}/{d1} = {pct_wrong_old:5.1f}%")
+    args.logger.info(f"    NOVEL class swallowed:     {audit['n_novel_contamination']:4d}/{d1} = {pct_novel:5.1f}%")
     if audit['novel_true_labels']:
-        args.logger.info(f"  True identities of swallowed novel samples: "
+        args.logger.info(f"    True identities of swallowed novel samples: "
                          f"{dict(sorted(audit['novel_true_labels'].items()))}")
     verdict = ("OK (<10% wrong)" if pct_ok >= 90 else
                "BIASED (10-30% wrong)" if pct_ok >= 70 else
                "HEAVILY BIASED (>30% wrong)")
-    args.logger.info(f"  VERDICT: {verdict}")
+    args.logger.info(f"    VERDICT D1: {verdict}")
+
+    # ---- Direction 2: novel door (new; silent when known-only modes run) ----
+    if d2 == 0:
+        args.logger.info(f"  [D2 novel door] n=0 — known-only selection, nothing to audit.")
+    else:
+        pct_nok = _pct(audit.get('n_novel_correct', 0), d2)
+        pct_leak = _pct(audit.get('n_known_leakage', 0), d2)
+        pct_conf = _pct(audit.get('n_novel_confused', 0), d2)
+        args.logger.info(f"  [D2 novel door] n={d2}")
+        args.logger.info(f"    Correct (novel==novel):    {audit.get('n_novel_correct', 0):4d}/{d2} = {pct_nok:5.1f}%")
+        args.logger.info(f"    KNOWN leaked as novel:     {audit.get('n_known_leakage', 0):4d}/{d2} = {pct_leak:5.1f}%")
+        args.logger.info(f"    NOVEL-vs-NOVEL confused:   {audit.get('n_novel_confused', 0):4d}/{d2} = {pct_conf:5.1f}%")
+        if audit.get('known_leak_sources'):
+            args.logger.info(f"    Known classes leaking out: {_top(audit['known_leak_sources'])}")
+        if audit.get('novel_confused_true'):
+            args.logger.info(f"    Novel classes getting mixed: {_top(audit['novel_confused_true'])}")
+        verdict2 = ("OK (<15% bad)" if (pct_leak + pct_conf) < 15 else
+                    "RISKY (15-40% bad)" if (pct_leak + pct_conf) < 40 else
+                    "HEAVILY BIASED (>40% bad)")
+        args.logger.info(f"    VERDICT D2: {verdict2}")
+
+    # ---- Cumulative evidence table (this iter + history) ----
+    _log_audit_evidence_table(audit, pseudo_iteration, args)
     args.logger.info("-" * 60 + "\n")
+
+
+def _log_audit_evidence_table(audit, pseudo_iteration, args):
+    """Evidence table: per-iteration + cumulative contamination, both doors.
+
+    History comes from args.pseudo_events (entries carry the same audit keys via
+    **audit spread); the current audit is appended on top. Shows whether errors
+    accumulate (drift) or stabilize — the core evidence for window decisions.
+    """
+    history = list(getattr(args, 'pseudo_events', []) or [])
+    rows = []
+    cum_d1_eaten = cum_d2_leak = cum_d2_conf = 0
+    for ev in history:
+        cum_d1_eaten += ev.get('n_novel_contamination', 0)
+        cum_d2_leak += ev.get('n_known_leakage', 0)
+        cum_d2_conf += ev.get('n_novel_confused', 0)
+        rows.append((ev.get('iteration', '?'), ev.get('epoch', '?'),
+                     ev.get('n_selected_d1', ev.get('n_selected_gt', 0)),
+                     ev.get('n_novel_contamination', 0), cum_d1_eaten,
+                     ev.get('n_selected_d2', 0),
+                     ev.get('n_known_leakage', 0), cum_d2_leak))
+    cum_d1_eaten += audit.get('n_novel_contamination', 0)
+    cum_d2_leak += audit.get('n_known_leakage', 0)
+    cum_d2_conf += audit.get('n_novel_confused', 0)
+    cur_epoch = getattr(args, 'current_epoch', '?')
+    rows.append((pseudo_iteration, cur_epoch,
+                 audit.get('n_selected_d1', audit.get('n_selected_gt', 0)),
+                 audit.get('n_novel_contamination', 0), cum_d1_eaten,
+                 audit.get('n_selected_d2', 0),
+                 audit.get('n_known_leakage', 0), cum_d2_leak))
+
+    args.logger.info("  [EVIDENCE] Contamination across iterations (per-iter | cumulative):")
+    args.logger.info("    iter | epoch | d1_sel | d1_novel_eaten(iter|cum) | d2_sel | d2_known_leak(iter|cum)")
+    for r in rows:
+        args.logger.info(f"    {r[0]:>4} | {str(r[1]):>5} | {r[2]:6d} | "
+                         f"{r[3]:6d} | {r[4]:6d}          | {r[5]:6d} | "
+                         f"{r[6]:6d} | {r[7]:6d}")
+    # Cumulative top offenders on both doors (merged over history + current)
+    from collections import Counter
+    eaten, leaked = Counter(), Counter()
+    for ev in history:
+        eaten.update(ev.get('novel_true_labels', {}) or {})
+        leaked.update(ev.get('known_leak_sources', {}) or {})
+    eaten.update(audit.get('novel_true_labels', {}) or {})
+    leaked.update(audit.get('known_leak_sources', {}) or {})
+    if eaten:
+        args.logger.info(f"    Cumulative novel classes eaten (top5): {_top(dict(eaten))}")
+    if leaked:
+        args.logger.info(f"    Cumulative known classes leaked (top5): {_top(dict(leaked))}")
+    if cum_d2_conf:
+        args.logger.info(f"    Cumulative novel-vs-novel confused: {cum_d2_conf}")
 
 
 def log_labeled_distribution(orig_counts, cur_counts, pseudo_added_per_class, args):
@@ -1246,7 +1726,15 @@ if __name__ == "__main__":
     parser.add_argument('--eval-funcs', type=list, default=['v2'])
     parser.add_argument('--dataset-name', type=str, default='cifar100')
     parser.add_argument('--prop-train-labels', type=float, default=0.5)
+    parser.add_argument('--seed', type=int, default=-1,
+                        help='Train seed cho repeats (paper: r1/r2/r3 dung 1/2/3). '
+                             '-1 = legacy (luon 20364, khop moi run cu). '
+                             'Split data van fix 416, KMeans eval van fix 0 — '
+                             'seed chi doi init + sampler + aug.')
     parser.add_argument('--grad-from-block', type=int, default=11)
+    parser.add_argument('--backbone', type=str, default='dinov2_vitb14',
+                        choices=['dino_vitb16', 'dinov2_vitb14', 'dinov2_vitb14_reg'],
+                        help='ViT backbone: DINOv1 B/16 or DINOv2 B/14 (default: dinov2_vitb14)')
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--momentum', type=float, default=0.9)
@@ -1276,9 +1764,22 @@ if __name__ == "__main__":
     parser.add_argument('--stop-epoch', default=200, type=int)
     parser.add_argument('--imb-ratio', default=100, type=int)
     parser.add_argument("--enable-pseudo-labeling", action="store_true", default=False)
-    parser.add_argument("--pseudo-mode", type=int, default=1, choices=[1, 2, 3],
-                        help="1=best TRAIN-acc (Cach A, sach), 2=threshold rai deu, 3=best conf unsupervised (Cach B, sach)")
+    parser.add_argument("--pseudo-mode", type=int, default=1, choices=[0, 1, 2, 3],
+                        help="0=tat cua known (chi novel, ablation sach cho novel-door), "
+                             "1=best TRAIN-acc (Cach A, sach), 2=threshold rai deu, "
+                             "3=best conf unsupervised (Cach B, sach)")
     parser.add_argument("--confidence-threshold", type=float, default=0.9)
+    parser.add_argument("--pseudo-conf-bar", type=float, default=0.5,
+                        help="Mode 3: mau duoc tinh high-conf khi conf >= bar. "
+                             "Class tot nhat = class co NHIEU mau high-conf nhat. "
+                             "Chi dung khi --pseudo-bar-k <= 0.")
+    parser.add_argument("--pseudo-bar-k", type=float, default=2.0,
+                        help="Mode 3: bar tuong doi bar = k / num_classes "
+                             "(CUB-200 -> 0.01 ~ giua p50-p90 thuc do; k <= 0 thi "
+                             "dung --pseudo-conf-bar).")
+    parser.add_argument("--pseudo-min-hi", type=int, default=10,
+                        help="Mode 3: class can >= min_hi mau high-conf, khong thi SKIP "
+                             "iteration (khong fallback nhu cu).")
     parser.add_argument("--pseudo-top-ratio", type=float, default=0.8,
                         help="Mode 1/3: fraction of highest-confidence target-class samples to keep")
     parser.add_argument("--max-samples-per-class", type=int, default=500)
@@ -1286,6 +1787,25 @@ if __name__ == "__main__":
     parser.add_argument("--max-pseudo-iterations", type=int, default=3)
     parser.add_argument("--pseudo-warmup-epoch", type=int, default=30,
                         help="Chi bat dau bom pseudo tu epoch nay (cho feature/head on dinh)")
+    # ---- Novel-door pseudo (D2): cluster-anchored, 1 cong tac duy nhat ----
+    # Tat ca nguong duoi da co default; muon chay novel-pseudo chi can them
+    # --enable-novel-pseudo (yeu cau --enable-pseudo-labeling bat truoc).
+    parser.add_argument("--enable-novel-pseudo", action="store_true", default=False,
+                        help="Bat cua novel (D2): KMeans tren CL-feature + 3 gates consensus "
+                             "(stability/silhouette/agreement). Tat = known-only nhu cu.")
+    parser.add_argument("--novel-warmup-epoch", type=int, default=50,
+                        help="Mo cua novel muon hon known 20 epoch (feature novel can chin)")
+    parser.add_argument("--novel-update-freq", type=int, default=10)
+    parser.add_argument("--max-novel-iterations", type=int, default=2,
+                        help="So iter novel toi da (50,60 voi default) — dong som chong drift")
+    parser.add_argument("--novel-max-samples", type=int, default=100,
+                        help="Cap moi novel dim (known dang 500) — de dat, it nhung chac")
+    parser.add_argument("--novel-jaccard-th", type=float, default=0.6,
+                        help="Stability: Jaccard tap thanh vien voi run seed khac")
+    parser.add_argument("--novel-agree-th", type=float, default=0.7,
+                        help="Agreement: ti le CE-pred cung 1 novel dim trong cum")
+    parser.add_argument("--novel-min-size", type=int, default=10,
+                        help="Cum nho hon thi bo (chong collapse)")
     parser.add_argument("--use-exact-exp-root", action="store_true", default=False)
     parser.add_argument("--vis-freq", type=int, default=10,
                         help="How often (epochs) to generate PCA, t-SNE, Confusion Matrices")
@@ -1341,26 +1861,25 @@ if __name__ == "__main__":
     args.interpolation = 3
     args.crop_pct = 0.875
 
-    backbone = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
-    
-    args.image_size = 224
-    args.feat_dim = 768
+    from model.backbone import load_backbone, backbone_spec, set_finetune_blocks
+    backbone = load_backbone(args.backbone)
+
+    spec = backbone_spec(args.backbone)
+    args.image_size = spec['image_size']
+    args.feat_dim = spec['feat_dim']
+    args.patch_size = spec['patch_size']
     args.num_mlp_layers = 3
 
     # ----------------------
     # HOW MUCH OF BASE MODEL TO FINETUNE
     # ----------------------
-    for m in backbone.parameters():
-        m.requires_grad = False
+    # Only finetune layers from block 'args.grad_from_block' onwards.
+    # set_finetune_blocks handles both DINOv1 (block.<i>) and DINOv2
+    # (blocks.<i> / chunked blocks.<c>.<i>) param names.
+    set_finetune_blocks(backbone, args.grad_from_block)
 
-    # Only finetune layers from block 'args.grad_from_block' onwards
-    for name, m in backbone.named_parameters():
-        if 'block' in name:
-            block_num = int(name.split('.')[1])
-            if block_num >= args.grad_from_block:
-                m.requires_grad = True
-
-    args.logger.info('model build')
+    args.logger.info(f"model build: backbone={args.backbone} "
+                     f"(feat_dim={args.feat_dim}, patch={args.patch_size})")
 
     # --------------------
     # CONTRASTIVE TRANSFORM
@@ -1375,7 +1894,19 @@ if __name__ == "__main__":
                                                                                          test_transform,
                                                                                          args)
 
-    seed = torch.randint(0, 100000, (1,)).item()
+    # Train seed: --seed >= 0 -> dung seed do (repeats r1/r2/r3 cho paper).
+    # --seed -1 (default) -> legacy: randint sau khi pipeline da seed cung 416
+    # nen LUON ra 20364 (da verify) — giu de so duoc voi moi run cu.
+    if getattr(args, 'seed', -1) is not None and int(getattr(args, 'seed', -1)) >= 0:
+        seed = int(args.seed)
+    else:
+        seed = torch.randint(0, 100000, (1,)).item()
+    args.train_seed = seed
+    try:
+        args.logger.info(f'[SEED] train_seed={seed} '
+                         f"({'explicit --seed' if getattr(args, 'seed', -1) is not None and int(getattr(args, 'seed', -1)) >= 0 else 'legacy-20364'})")
+    except Exception:
+        print(f'[SEED] train_seed={seed}')
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)

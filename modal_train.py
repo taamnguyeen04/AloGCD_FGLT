@@ -113,7 +113,9 @@ def _generate_experiment_name(
     imb_ratio: int = 100,
     pseudo_mode: int = 0,
     confidence_threshold: float = 0.9,
-    extra_suffix: str = ""
+    extra_suffix: str = "",
+    backbone: str = "dinov2_vitb14",
+    novel_pseudo: bool = False,
 ) -> str:
     """Generate a descriptive experiment name."""
     now = datetime.now()
@@ -133,7 +135,12 @@ def _generate_experiment_name(
     else:
         variant_str = variant
     
-    parts = [dataset_name, variant_str, f"imb{imb_ratio}", timestamp]
+    backbone_tag = {"dino_vitb16": "dinov1b16",
+                      "dinov2_vitb14": "dinov2b14",
+                      "dinov2_vitb14_reg": "dinov2b14reg"}.get(backbone, backbone)
+    if novel_pseudo:
+        variant_str = f"{variant_str}+novel"
+    parts = [dataset_name, backbone_tag, variant_str, f"imb{imb_ratio}", timestamp]
     
     if extra_suffix:
         parts.insert(-1, extra_suffix)
@@ -164,6 +171,19 @@ def train(
     pseudo_update_freq: int = 10,
     max_pseudo_iterations: int = 20,
     pseudo_warmup_epoch: int = 30,
+    pseudo_conf_bar: float = 0.5,
+    pseudo_bar_k: float = 2.0,
+    pseudo_min_hi: int = 10,
+    # Novel-door pseudo (D2): 1 cong tac duy nhat --enable-novel-pseudo tren CLI
+    # (Modal tu doi _ thanh -). Tat = known-only nhu cu.
+    enable_novel_pseudo: bool = False,
+    novel_warmup_epoch: int = 50,
+    novel_update_freq: int = 10,
+    max_novel_iterations: int = 2,
+    novel_max_samples: int = 100,
+    novel_jaccard_th: float = 0.6,
+    novel_agree_th: float = 0.7,
+    novel_min_size: int = 10,
     # Visualization frequency (0 = off)
     vis_freq: int = 10,
     # AdaPart arguments
@@ -175,11 +195,19 @@ def train(
     ablate_confidence: bool = False,
     ablate_adaptive_capacity: bool = False,
     ablate_concat_eval: bool = False,
+    # Backbone: dino_vitb16 (DINOv1) or dinov2_vitb14[_reg] (DINOv2, default)
+    backbone: str = "dinov2_vitb14",
+    # Train seed: -1 = legacy deterministic (20364); >=0 = explicit repeat seed
+    seed: int = -1,
     # Custom experiment name
     exp_name_suffix: str = "",
 ) -> dict:
     """Train BaCon model with optional pseudo labeling."""
-    
+
+    # Modal chi convert _ -> - o TEN co, VALUE giu nguyen -> user go
+    # 'dinov2-vitb14' van chay duoc (chuan hoa ve underscore cua bacon.py).
+    backbone = (backbone or "").replace("-", "_")
+
     project_dir = Path(PROJECT_DIR)
     data_dir = Path(DATA_DIR)
     output_dir = Path(OUTPUT_DIR)
@@ -202,7 +230,9 @@ def train(
         imb_ratio=imb_ratio,
         pseudo_mode=pseudo_mode if enable_pseudo_labeling else 0,
         confidence_threshold=confidence_threshold,
-        extra_suffix=exp_name_suffix
+        extra_suffix=exp_name_suffix,
+        backbone=backbone,
+        novel_pseudo=enable_novel_pseudo,
     )
     
     exp_dirs = _create_experiment_dirs(experiment_name)
@@ -279,10 +309,30 @@ def train(
         command.extend(["--pseudo-update-freq", str(pseudo_update_freq)])
         command.extend(["--max-pseudo-iterations", str(max_pseudo_iterations)])
         command.extend(["--pseudo-warmup-epoch", str(pseudo_warmup_epoch)])
+        command.extend(["--pseudo-conf-bar", str(pseudo_conf_bar)])
+        command.extend(["--pseudo-bar-k", str(pseudo_bar_k)])
+        command.extend(["--pseudo-min-hi", str(pseudo_min_hi)])
+        # Novel door (D2): chi truyen khi bat --enable-novel-pseudo
+        if enable_novel_pseudo:
+            command.append("--enable-novel-pseudo")
+            command.extend(["--novel-warmup-epoch", str(novel_warmup_epoch)])
+            command.extend(["--novel-update-freq", str(novel_update_freq)])
+            command.extend(["--max-novel-iterations", str(max_novel_iterations)])
+            command.extend(["--novel-max-samples", str(novel_max_samples)])
+            command.extend(["--novel-jaccard-th", str(novel_jaccard_th)])
+            command.extend(["--novel-agree-th", str(novel_agree_th)])
+            command.extend(["--novel-min-size", str(novel_min_size)])
 
     # Visualization frequency (PCA / t-SNE / confusion matrix)
     command.extend(["--vis-freq", str(vis_freq)])
-    
+
+    # Backbone (must match model/bacon.py --backbone choices)
+    command.extend(["--backbone", backbone])
+
+    # Train seed: -1 = legacy (20364, khop run cu); >=0 = repeat co chu dich
+    if seed is not None and int(seed) >= 0:
+        command.extend(["--seed", str(int(seed))])
+
     # AdaPart arguments
     if use_parts:
         command.append("--use-parts")
@@ -393,6 +443,18 @@ def main(
     pseudo_update_freq: int = 10,
     max_pseudo_iterations: int = 20,
     pseudo_warmup_epoch: int = 30,
+    pseudo_conf_bar: float = 0.5,
+    pseudo_bar_k: float = 2.0,
+    pseudo_min_hi: int = 10,
+    # Novel-door pseudo (D2): 1 cong tac duy nhat
+    enable_novel_pseudo: bool = False,
+    novel_warmup_epoch: int = 50,
+    novel_update_freq: int = 10,
+    max_novel_iterations: int = 2,
+    novel_max_samples: int = 100,
+    novel_jaccard_th: float = 0.6,
+    novel_agree_th: float = 0.7,
+    novel_min_size: int = 10,
     # AdaPart flags
     use_parts: bool = False,
     num_slots: int = 3,
@@ -402,6 +464,8 @@ def main(
     ablate_confidence: bool = False,
     ablate_adaptive_capacity: bool = False,
     ablate_concat_eval: bool = False,
+    backbone: str = "dinov2_vitb14",
+    seed: int = -1,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -429,15 +493,27 @@ def main(
         pseudo_update_freq=pseudo_update_freq,
         max_pseudo_iterations=max_pseudo_iterations,
         pseudo_warmup_epoch=pseudo_warmup_epoch,
+        pseudo_conf_bar=pseudo_conf_bar,
+        pseudo_bar_k=pseudo_bar_k,
+        pseudo_min_hi=pseudo_min_hi,
+        enable_novel_pseudo=enable_novel_pseudo,
+        novel_warmup_epoch=novel_warmup_epoch,
+        novel_update_freq=novel_update_freq,
+        max_novel_iterations=max_novel_iterations,
+        novel_max_samples=novel_max_samples,
+        novel_jaccard_th=novel_jaccard_th,
+        novel_agree_th=novel_agree_th,
+        novel_min_size=novel_min_size,
         # AdaPart flags
         use_parts=use_parts,
         num_slots=num_slots,
         part_lambda=part_lambda,
         ablate_fused_ce=ablate_fused_ce,
-        ablate_spatial_loss=ablate_spatial_loss,
         ablate_confidence=ablate_confidence,
         ablate_adaptive_capacity=ablate_adaptive_capacity,
         ablate_concat_eval=ablate_concat_eval,
+        backbone=backbone,
+        seed=seed,
         # Visualization frequency (PCA / t-SNE / confusion matrix)
         vis_freq=vis_freq,
         # Custom experiment name
@@ -475,6 +551,18 @@ def launch(
     pseudo_update_freq: int = 10,
     max_pseudo_iterations: int = 20,
     pseudo_warmup_epoch: int = 30,
+    pseudo_conf_bar: float = 0.5,
+    pseudo_bar_k: float = 2.0,
+    pseudo_min_hi: int = 10,
+    # Novel-door pseudo (D2): 1 cong tac duy nhat
+    enable_novel_pseudo: bool = False,
+    novel_warmup_epoch: int = 50,
+    novel_update_freq: int = 10,
+    max_novel_iterations: int = 2,
+    novel_max_samples: int = 100,
+    novel_jaccard_th: float = 0.6,
+    novel_agree_th: float = 0.7,
+    novel_min_size: int = 10,
     # AdaPart flags
     use_parts: bool = False,
     num_slots: int = 3,
@@ -484,6 +572,8 @@ def launch(
     ablate_confidence: bool = False,
     ablate_adaptive_capacity: bool = False,
     ablate_concat_eval: bool = False,
+    backbone: str = "dinov2_vitb14",
+    seed: int = -1,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -519,14 +609,26 @@ def launch(
         pseudo_update_freq=pseudo_update_freq,
         max_pseudo_iterations=max_pseudo_iterations,
         pseudo_warmup_epoch=pseudo_warmup_epoch,
+        pseudo_conf_bar=pseudo_conf_bar,
+        pseudo_bar_k=pseudo_bar_k,
+        pseudo_min_hi=pseudo_min_hi,
+        enable_novel_pseudo=enable_novel_pseudo,
+        novel_warmup_epoch=novel_warmup_epoch,
+        novel_update_freq=novel_update_freq,
+        max_novel_iterations=max_novel_iterations,
+        novel_max_samples=novel_max_samples,
+        novel_jaccard_th=novel_jaccard_th,
+        novel_agree_th=novel_agree_th,
+        novel_min_size=novel_min_size,
         use_parts=use_parts,
         num_slots=num_slots,
         part_lambda=part_lambda,
         ablate_fused_ce=ablate_fused_ce,
-        ablate_spatial_loss=ablate_spatial_loss,
         ablate_confidence=ablate_confidence,
         ablate_adaptive_capacity=ablate_adaptive_capacity,
         ablate_concat_eval=ablate_concat_eval,
+        backbone=backbone,
+        seed=seed,
         vis_freq=vis_freq,
         exp_name_suffix=exp_name_suffix,
     )

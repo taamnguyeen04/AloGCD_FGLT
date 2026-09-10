@@ -130,10 +130,12 @@ def group_accuracy(mapped, targets, classes):
 
 
 # ── Model helpers ─────────────────────────────────────────────────────────────
-def load_backbone(checkpoint_path, device):
+def load_backbone(checkpoint_path, device, backbone_name="dinov2_vitb14"):
     import torch
-    logging.info("Loading DINO ViT-B/16 backbone")
-    backbone = torch.hub.load("facebookresearch/dino:main", "dino_vitb16")
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from model.backbone import load_backbone as load_hub_backbone
+    logging.info("Loading %s backbone", backbone_name)
+    backbone = load_hub_backbone(backbone_name)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if "cl_backbone" not in checkpoint:
         raise KeyError(f"Checkpoint does not contain 'cl_backbone': {checkpoint_path}")
@@ -245,7 +247,7 @@ def evaluate_checkpoint(checkpoint_path, label, dataset, args, device):
     )
 
     logging.info("[%s] Extracting %s test features (%d images)", label, dataset, len(test_dataset))
-    backbone = load_backbone(checkpoint_path, device)
+    backbone = load_backbone(checkpoint_path, device, getattr(args, 'backbone', 'dinov2_vitb14'))
     features, targets = extract_features(backbone, loader, device)
     logging.info("[%s] Feature shape: %s", label, features.shape)
 
@@ -255,6 +257,14 @@ def evaluate_checkpoint(checkpoint_path, label, dataset, args, device):
     ).fit_predict(features)
 
     mapped = align_clusters(targets, predictions, num_classes)
+    try:
+        from sklearn.metrics import (adjusted_rand_score,
+                                     normalized_mutual_info_score)
+        nmi = round(float(normalized_mutual_info_score(targets, predictions)), 4)
+        ari = round(float(adjusted_rand_score(targets, predictions)), 4)
+    except Exception:
+        nmi, ari = None, None
+    logging.info("[%s] Clustering structure: NMI %s | ARI %s", label, nmi, ari)
     groups = class_groups(dataset, args.imb_ratio)
 
     result = {
@@ -274,6 +284,8 @@ def evaluate_checkpoint(checkpoint_path, label, dataset, args, device):
         result[f"{split}_all"]  = round(group_accuracy(mapped, targets, all_cls), 4)
 
     result["overall"] = round(100.0 * float(np.mean(mapped == targets)), 4)
+    result["nmi"] = nmi
+    result["ari"] = ari
 
     logging.info(
         "[%s] Known Many %.2f | Med %.2f | Few %.2f | All %.2f",
@@ -296,7 +308,7 @@ CSV_FIELDS = [
     "method", "dataset",
     "known_many", "known_med", "known_few", "known_std", "known_all",
     "novel_many", "novel_med", "novel_few", "novel_std", "novel_all",
-    "overall", "checkpoint",
+    "overall", "nmi", "ari", "checkpoint",
 ]
 
 
@@ -315,6 +327,9 @@ def main():
                         help="Imbalance ratio (used for CIFAR index files)")
     parser.add_argument("--tsne_output", default=None,
                         help="Path to save t-SNE PNG. If omitted, t-SNE is skipped.")
+    parser.add_argument("--backbone", default="dinov2_vitb14",
+                        choices=["dino_vitb16", "dinov2_vitb14", "dinov2_vitb14_reg"],
+                        help="Backbone arch matching the checkpoint")
     args = parser.parse_args()
 
     if args.bacon_o_checkpoint is None and args.bacon_s_checkpoint is None:

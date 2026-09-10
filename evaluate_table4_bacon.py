@@ -88,7 +88,11 @@ def load_features(checkpoint_path, dataset_name, args, device):
         num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
     )
 
-    backbone = torch.hub.load("facebookresearch/dino:main", "dino_vitb16")
+    backbone_name = getattr(args, 'backbone', 'dinov2_vitb14')
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from model.backbone import load_backbone as load_hub_backbone
+    logging.info("Loading %s backbone", backbone_name)
+    backbone = load_hub_backbone(backbone_name)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if "cl_backbone" not in checkpoint:
         raise KeyError(f"Checkpoint does not contain 'cl_backbone': {checkpoint_path}")
@@ -159,6 +163,14 @@ def evaluate(checkpoint_path, label, dataset_name, args, device):
         n_clusters=num_classes, random_state=args.seed, n_init=args.n_init,
     ).fit_predict(features)
     mapped = align_clusters(targets, predictions, num_classes)
+    try:
+        from sklearn.metrics import (adjusted_rand_score,
+                                     normalized_mutual_info_score)
+        nmi = round(float(normalized_mutual_info_score(targets, predictions)), 4)
+        ari = round(float(adjusted_rand_score(targets, predictions)), 4)
+    except Exception:
+        nmi, ari = None, None
+    logging.info("Clustering structure: NMI %s | ARI %s", nmi, ari)
     groups = class_groups(dataset_name, args.imb_ratio)
     result = {"method": label, "dataset": dataset_name,
               "checkpoint": os.path.abspath(checkpoint_path)}
@@ -172,6 +184,8 @@ def evaluate(checkpoint_path, label, dataset_name, args, device):
         all_classes = np.concatenate([groups[split][name] for name in ("Many", "Med", "Few")])
         result[f"{prefix}_all"] = group_accuracy(mapped, targets, all_classes)
     result["overall"] = 100.0 * np.mean(mapped == targets)
+    result["nmi"] = nmi
+    result["ari"] = ari
     return result
 
 
@@ -191,6 +205,9 @@ def main():
     parser.add_argument("--imb_ratio", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n_init", type=int, default=10)
+    parser.add_argument("--backbone", default="dinov2_vitb14",
+                        choices=["dino_vitb16", "dinov2_vitb14", "dinov2_vitb14_reg"],
+                        help="Backbone arch matching the checkpoint")
     args = parser.parse_args()
 
     if args.log_file is None:
@@ -225,7 +242,7 @@ def main():
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         fields = ["method", "dataset", "known_many", "known_med", "known_few",
                   "known_std", "known_all", "novel_many", "novel_med", "novel_few",
-                  "novel_std", "novel_all", "overall", "checkpoint"]
+                  "novel_std", "novel_all", "overall", "nmi", "ari", "checkpoint"]
         with open(args.output, "w", newline="", encoding="utf-8") as output_file:
             writer = csv.DictWriter(output_file, fieldnames=fields)
             writer.writeheader()
