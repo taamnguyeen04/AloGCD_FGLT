@@ -66,6 +66,28 @@ def _ema_update_teacher(teacher_ce, student_ce, m):
         pt.mul_(m).add_(ps.detach(), alpha=1.0 - m)
 
 
+def _build_teacher_ce(student_ce, args, device):
+    """Dung teacher = copy CE (backbone+head), requires_grad=False, eval mode.
+
+    deepcopy truc tiep thuong du, NHUNG CE_Head dung weight_norm nen module
+    deepcopy sap tren torch>=2.1 (non-leaf tensors) -> fallback: deepcopy
+    backbone (ViT thuan, an toan) + rebuild head + load_state_dict.
+    """
+    try:
+        teacher_ce = deepcopy(student_ce)
+    except RuntimeError:
+        bb, head = student_ce[0], student_ce[1]
+        teacher_bb = deepcopy(bb)
+        teacher_head = CE_Head(in_dim=args.feat_dim, out_dim=args.mlp_out_dim,
+                               nlayers=args.num_mlp_layers).to(device)
+        teacher_head.load_state_dict(head.state_dict())
+        teacher_ce = nn.Sequential(teacher_bb, teacher_head).to(device)
+    for p in teacher_ce.parameters():
+        p.requires_grad = False
+    teacher_ce.eval()
+    return teacher_ce
+
+
 
 
 def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_loader, args):
@@ -94,10 +116,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     teacher_ce = None
     teacher_m0 = float(getattr(args, 'teacher_m0', 0.996))
     if getattr(args, 'use_momentum_teacher', False):
-        teacher_ce = deepcopy(student_ce)
-        for p in teacher_ce.parameters():
-            p.requires_grad = False
-        teacher_ce.eval()
+        teacher_ce = _build_teacher_ce(student_ce, args, device)
         args.logger.info(f'[TEACHER] Momentum teacher ON (m0={teacher_m0} -> 1.0 cosine).')
     else:
         args.logger.info('[TEACHER] OFF — cluster loss targets = student.detach() (legacy).')
