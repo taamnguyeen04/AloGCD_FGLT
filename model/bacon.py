@@ -394,18 +394,37 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             args.logger.info('Testing on disjoint test set...')
             with torch.no_grad():
                 (all_acc_test_cl, old_acc_test_cl, new_acc_test_cl,
-                 acc_list_cl, cl_ind_map, _, _) = test(
+                 acc_list_cl, cl_ind_map, nmi_cl, ari_cl) = test(
                     student_cl,
                     test_loader,
                     epoch=epoch,
                     save_name='Test ACC',
                     args=args,
                     train_loader=train_loader)
-            
+
             args.logger.info(
                     'Test Accuracies CL: All {:.1f} | Old {:.1f} | New {:.1f}'.format(all_acc_test_cl,
                                                                                       old_acc_test_cl,
                                                                                       new_acc_test_cl))
+            # Per-epoch test history (viec 5: novel-tax line ve post-hoc tu JSON,
+            # khong parse log). Lazy-init de run cu khong anh huong.
+            if getattr(args, '_test_history', None) is None:
+                args._test_history = []
+            try:
+                args._test_history.append({
+                    'epoch': int(epoch),
+                    'all': float(all_acc_test_cl), 'old': float(old_acc_test_cl),
+                    'new': float(new_acc_test_cl),
+                    'k_many': float(acc_list_cl[0]), 'k_med': float(acc_list_cl[1]),
+                    'k_few': float(acc_list_cl[2]),
+                    'u_many': float(acc_list_cl[3]), 'u_med': float(acc_list_cl[4]),
+                    'u_few': float(acc_list_cl[5]),
+                    'nmi': float(nmi_cl) if nmi_cl is not None else None,
+                    'ari': float(ari_cl) if ari_cl is not None else None,
+                    'pseudo_total': int(pseudo_samples_added) if args.enable_pseudo_labeling else 0,
+                })
+            except Exception:
+                pass
 
             # Evaluate and log per-class accuracy
             student_cl.eval()
@@ -427,6 +446,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             
             if should_update and pseudo_iteration < args.max_pseudo_iterations:
                 pseudo_iteration += 1
+                # Reset per-iter novel gate summary (events entry takes whatever
+                # D2 sets this iter; None = D2 did not run).
+                args._novel_gate_summary = None
                 args.logger.info("\n" + "="*60)
                 args.logger.info(f"[PSEUDO LABELING] Iteration {pseudo_iteration}")
                 args.logger.info("="*60)
@@ -570,9 +592,11 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                         'epoch': epoch,
                         'n_selected': len(new_pseudo),
                         **audit,   # d1 keys + d2 keys (n_novel_correct / n_known_leakage / ...)
+                        # novel gate funnel (None when D2 did not run this iter)
+                        'novel_gate': getattr(args, '_novel_gate_summary', None),
                         'pseudo_samples_total': pseudo_samples_added,
                         **{f'labeled_c{c}': labeled_class_counts.get(c, 0)
-                           for c in sorted(set(orig_labeled_counts) | set(labeled_class_counts))},
+                            for c in sorted(set(orig_labeled_counts) | set(labeled_class_counts))},
                     })
                     save_bias_evidence_chart(args.pseudo_events, pseudo_iteration, args)
                     args.logger.info(f"Total pseudo samples added: {pseudo_samples_added}")
@@ -679,6 +703,27 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             args.logger.warning('[FINAL EVAL] No best checkpoint found — skipping final report.')
     except Exception as e:
         args.logger.warning(f'[FINAL EVAL] Final evaluation failed: {e}')
+
+    # ----------------------
+    # MACHINE-READABLE HISTORIES for post-hoc visualization (viec 5).
+    # test_history: per-epoch all/old/new (+NMI/ARI, pseudo_total).
+    # pseudo_events: per-iteration audit (D1+D2 keys via **audit spread).
+    # Old runs lack these files — plot scripts fall back to parsing log.txt.
+    # ----------------------
+    try:
+        import json as _json
+        hist_dir = os.path.abspath(os.path.join(args.model_dir, os.pardir))
+        os.makedirs(hist_dir, exist_ok=True)
+        with open(os.path.join(hist_dir, 'test_history.json'), 'w', encoding='utf-8') as f:
+            _json.dump(getattr(args, '_test_history', []) or [], f)
+        with open(os.path.join(hist_dir, 'pseudo_events.json'), 'w', encoding='utf-8') as f:
+            _json.dump(getattr(args, 'pseudo_events', []) or [], f,
+                       default=lambda o: (dict(o) if isinstance(o, dict) else str(o)))
+        args.logger.info('[HISTORY] Saved test_history.json + pseudo_events.json '
+                         f'({len(getattr(args, "_test_history", []) or [])} test rounds, '
+                         f'{len(getattr(args, "pseudo_events", []) or [])} pseudo iters).')
+    except Exception as e:
+        args.logger.warning(f'[HISTORY] Failed to write history JSONs: {e}')
 
 
 def test(model, test_loader, epoch, save_name, args, train_loader):
@@ -1099,6 +1144,10 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
         from scipy.optimize import linear_sum_assignment as linear_assignment
     except Exception as e:
         args.logger.warning(f"[NOVEL-PSEUDO] sklearn/scipy missing ({e}) — skipping.")
+        try:
+            args._novel_gate_summary = {'status': 'skipped-no-sklearn'}
+        except Exception:
+            pass
         return []
 
     try:
@@ -1199,6 +1248,11 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
         if prev_dbi is not None and dbi > prev_dbi * 1.05:
             args.logger.info(f"[NOVEL-PSEUDO] DBI {dbi:.3f} worse than prev {prev_dbi:.3f} "
                              f"(>5%) — skipping novel inject this iter.")
+            try:
+                args._novel_gate_summary = {'status': 'skipped-dbi',
+                                            'dbi': dbi, 'prev_dbi': prev_dbi}
+            except Exception:
+                pass
             return []
         args._novel_prev_dbi = dbi
 
@@ -1260,11 +1314,29 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
         for (c, size, stab, s_mean, td, agree, reason) in gate_rows:
             args.logger.info(f"  cluster {c:>3}: n={size:5d} stab={stab:.2f} "
                              f"sil={s_mean:+.2f} dim={td} agree={agree:.2f} {reason}")
+        # Gate funnel summary for post-hoc chart (viec 5): reason histogram +
+        # per-dim kept counts. Stored on args, merged into pseudo_events by caller.
+        try:
+            from collections import Counter as _Counter
+            reason_hist = dict(_Counter(r for (_, _, _, _, _, _, r) in gate_rows))
+            per_dim = dict(_Counter(int(s['label']) for s in selected))
+            args._novel_gate_summary = {'status': 'kept',
+                                        'n_leftover': int(len(leftover)),
+                                        'n_selected': int(len(selected)),
+                                        'sil_med': float(sil_med), 'dbi': float(dbi),
+                                        'reason_hist': reason_hist,
+                                        'per_dim': per_dim}
+        except Exception:
+            pass
         return selected
     except Exception as e:
         import traceback
         args.logger.warning(f"[NOVEL-PSEUDO] Failed (non-fatal, known-door unaffected): {e}")
         args.logger.warning(traceback.format_exc(limit=5))
+        try:
+            args._novel_gate_summary = {'status': 'failed', 'error': str(e)[:200]}
+        except Exception:
+            pass
         return []
 
 
@@ -1443,34 +1515,55 @@ def audit_pseudo_samples(pseudo_samples, uq2true, num_labeled):
     known_leak_sources = Counter()
     novel_confused_true = Counter()
     n_d1 = n_d2 = 0
+    # Per-outcome confidences (viec 5: reliability diagram ve post-hoc tu JSON).
+    # pseudo sample nao thieu 'confidence' thi bo qua rieng diem conf (van dem so luong).
+    c_ok, c_wo, c_sw, c_nok, c_lk, c_cf = [], [], [], [], [], []
     for s in pseudo_samples:
         true_lbl = uq2true.get(int(s['uq_idx']))
         if true_lbl is None:
             continue
         pseudo_lbl = int(s['label'])
+        try:
+            conf = float(s.get('confidence', float('nan')))
+        except Exception:
+            conf = float('nan')
+        import math as _math
+        has_conf = not _math.isnan(conf)
         if pseudo_lbl < num_labeled:
             # ---- Direction 1: selected as known ----
             n_d1 += 1
             if true_lbl < num_labeled:
                 if true_lbl == pseudo_lbl:
                     n_true_correct += 1
+                    if has_conf:
+                        c_ok.append(conf)
                 else:
                     n_wrong_old += 1
+                    if has_conf:
+                        c_wo.append(conf)
             else:
                 n_novel += 1
                 novel_true_labels[true_lbl] += 1
+                if has_conf:
+                    c_sw.append(conf)
         else:
             # ---- Direction 2: selected as novel ----
             n_d2 += 1
             if true_lbl >= num_labeled:
                 if true_lbl == pseudo_lbl:
                     n_novel_correct += 1
+                    if has_conf:
+                        c_nok.append(conf)
                 else:
                     n_novel_conf += 1
                     novel_confused_true[true_lbl] += 1
+                    if has_conf:
+                        c_cf.append(conf)
             else:
                 n_known_leak += 1
                 known_leak_sources[true_lbl] += 1
+                if has_conf:
+                    c_lk.append(conf)
     return {
         'n_selected_gt': len(pseudo_samples),
         'n_selected_d1': n_d1,
@@ -1484,6 +1577,12 @@ def audit_pseudo_samples(pseudo_samples, uq2true, num_labeled):
         'n_novel_confused': n_novel_conf,
         'known_leak_sources': dict(known_leak_sources),
         'novel_confused_true': dict(novel_confused_true),
+        'conf_correct': c_ok,
+        'conf_wrong_old': c_wo,
+        'conf_swallowed': c_sw,
+        'conf_novel_correct': c_nok,
+        'conf_leak': c_lk,
+        'conf_confused': c_cf,
     }
 
 

@@ -53,6 +53,86 @@ def plot_attention_maps(image_tensor, attention_map, save_path, M=3):
     plt.savefig(save_path, bbox_inches='tight', dpi=300)
     plt.close()
 
+def plot_argmax_segmap(image_tensor, attention_map, save_path, alpha=0.45):
+    """One-panel part segmentation: each patch colored by winning slot.
+
+    image_tensor: (3, H, W) normalized image.
+    attention_map: (M, N) with square N (196->14x14, 256->16x16).
+    Clearer than M heatmaps for papers: shows how the bird is partitioned
+    into beak/wing/tail regions at a glance.
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    img = image_tensor * std + mean
+    img = img.clamp(0, 1).permute(1, 2, 0).numpy()
+    img_uint8 = (img * 255).astype(np.uint8)
+
+    M, N = attention_map.shape
+    h = w = int(round(N ** 0.5))
+    assert h * w == N, f'non-square patch grid N={N}'
+    winner = attention_map.argmax(dim=0).reshape(h, w).detach().cpu().numpy()
+
+    seg_small = np.zeros((h, w, 3), dtype=np.uint8)
+    cmap = plt.get_cmap('tab10')
+    for m in range(M):
+        color = (np.array(cmap(m % 10)[:3]) * 255).astype(np.uint8)
+        seg_small[winner == m] = color
+    seg = cv2.resize(seg_small, (224, 224), interpolation=cv2.INTER_NEAREST)
+
+    overlay = cv2.addWeighted(img_uint8, 1.0 - alpha, seg, alpha, 0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(img)
+    axes[0].set_title('Original')
+    axes[0].axis('off')
+    axes[1].imshow(seg)
+    axes[1].set_title(f'Argmax parts ({h}x{h} grid)')
+    axes[1].axis('off')
+    axes[2].imshow(overlay)
+    axes[2].set_title('Overlay')
+    axes[2].axis('off')
+    for m in range(M):
+        color = cmap(m % 10)[:3]
+        axes[2].plot([], [], marker='s', color=color, linestyle='',
+                     label=f'Slot {m + 1}')
+    axes[2].legend(fontsize=8, loc='best')
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    plt.close()
+
+
+def plot_retrieval_grid(patches, save_path, title='Top patches per prototype',
+                        cols=9):
+    """Grid of retrieved patches: what does a prototype 'mean'?
+
+    patches: list of rows; each row is a list of (C, h, w) uint8/float tensors
+    (one row = one prototype's top-k). ProtoPNet-style evidence figure.
+    """
+    rows = len(patches)
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(1.6 * cols, 1.6 * rows),
+                             squeeze=False)
+    fig.suptitle(title, fontsize=11)
+    for r, row in enumerate(patches):
+        for c in range(cols):
+            ax = axes[r][c]
+            ax.axis('off')
+            if c < len(row):
+                p = row[c]
+                if torch.is_tensor(p):
+                    p = p.detach().cpu().numpy()
+                if p.shape[0] in (1, 3):
+                    p = np.transpose(p, (1, 2, 0))
+                if p.max() <= 1.0:
+                    p = (p * 255).astype(np.uint8)
+                ax.imshow(p.astype(np.uint8), interpolation='nearest')
+                if c == 0:
+                    ax.set_ylabel(f'proto {r + 1}', fontsize=9)
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    plt.close()
+
+
 def plot_gate_heatmap(gate_values, class_frequencies, save_path):
     """
     gate_values: (C, M)
@@ -89,6 +169,14 @@ def test_visualizations():
         attn_map[2, 3 * N // 4:3 * N // 4 + 10] = 1.0  # Slot 3 focuses on bottom
         plot_attention_maps(image, attn_map,
                             f'dev_outputs/visualizations/mock_attention_{tag}.png')
+        plot_argmax_segmap(image, torch.softmax(attn_map * 5.0, dim=0),
+                           f'dev_outputs/visualizations/mock_segmap_{tag}.png')
+
+    # 1b. Mock retrieval grid (3 prototypes x 9 patches of noise)
+    print("Generating mock retrieval grid...")
+    grid = [[torch.rand(3, 32, 32) for _ in range(9)] for _ in range(3)]
+    plot_retrieval_grid(grid, 'dev_outputs/visualizations/mock_retrieval.png',
+                        title='Mock: top-9 patches per prototype')
 
     # Non-square N must fail loudly instead of silently misshaping
     # (NB: 100 is square (10x10) — use a truly non-square N like 150.)
