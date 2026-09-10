@@ -53,6 +53,19 @@ def get_mean_lr(optimizer):
     return torch.mean(torch.Tensor([param_group['lr'] for param_group in optimizer.param_groups])).item()
 
 
+def _teacher_momentum(epoch, epochs, m0=0.996):
+    """DINO-style cosine schedule m0 -> 1.0 (teacher cang ve sau cang bao thu)."""
+    import math
+    return 1.0 - (1.0 - m0) * 0.5 * (1.0 + math.cos(math.pi * epoch / max(epochs, 1)))
+
+
+@torch.no_grad()
+def _ema_update_teacher(teacher_ce, student_ce, m):
+    """teacher <- m*teacher + (1-m)*student. Khong gradient, khong optimizer."""
+    for pt, ps in zip(teacher_ce.parameters(), student_ce.parameters()):
+        pt.mul_(m).add_(ps.detach(), alpha=1.0 - m)
+
+
 
 
 def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_loader, args):
@@ -74,6 +87,20 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
     student_ce = nn.Sequential(ce_backbone, ce_head).to(device)
     student_cl = nn.Sequential(cl_backbone, cl_head).to(device)
+
+    # A1 momentum teacher (opt-in): ban copy CE chay cham (EMA), lam dap an on
+    # dinh cho cluster loss thay vi student.detach() (thay = tro). set_model()
+    # chi bat/tat students -> teacher mai eval, khong doi.
+    teacher_ce = None
+    teacher_m0 = float(getattr(args, 'teacher_m0', 0.996))
+    if getattr(args, 'use_momentum_teacher', False):
+        teacher_ce = deepcopy(student_ce)
+        for p in teacher_ce.parameters():
+            p.requires_grad = False
+        teacher_ce.eval()
+        args.logger.info(f'[TEACHER] Momentum teacher ON (m0={teacher_m0} -> 1.0 cosine).')
+    else:
+        args.logger.info('[TEACHER] OFF — cluster loss targets = student.detach() (legacy).')
 
     params_groups_cl = list(cl_head.parameters()) + list(cl_backbone.parameters())
     params_groups_ce = get_params_groups(student_ce)
@@ -197,6 +224,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
     for epoch in range(args.epochs):
         args.current_epoch = epoch
+        # A1: momentum theo lich cosine (chi dung khi teacher bat)
+        args._teacher_m = _teacher_momentum(epoch, args.epochs, teacher_m0)
         loss_record_ce = AverageMeter()
         loss_record_cl = AverageMeter()
         ema_purity_record = AverageMeter()
@@ -226,7 +255,12 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
             ####################### COMPUTE LOSS #######################
             pstr = ''
-            teacher_out = student_out.detach()
+            if teacher_ce is not None:
+                # A1: dap an tu teacher cham (on dinh), khong phai student.detach()
+                with torch.no_grad():
+                    teacher_out = teacher_ce(images)
+            else:
+                teacher_out = student_out.detach()
 
             # clustering, unsup
             cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
@@ -234,6 +268,13 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             # clustering, sup
             sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
             sup_labels = torch.cat([class_labels[mask_lab] for _ in range(2)], dim=0)
+
+            # A4 logit-adjust (opt-in): diem cong cho class hiem (tail), tru theo
+            # tan suat uoc luong tu dist_est — cung chieu voi softconloss.
+            _la = getattr(args, 'est_adjustment', None) \
+                if getattr(args, 'use_logit_adjust', False) else None
+            if _la is not None:
+                sup_logits = sup_logits - _la
 
             cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
 
@@ -276,6 +317,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                             fused_labels,
                             lambda_part=args.part_lambda,
                             tau=args.tau_c,
+                            est_adjustment=(getattr(args, 'est_adjustment', None)
+                                            if getattr(args, 'use_logit_adjust', False)
+                                            else None),
                         )
                         loss_ce = loss_ce + loss_fused
                         pstr += f'fused_ce: {loss_fused.item():.2f} '
@@ -308,6 +352,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 optimizer_ce.zero_grad()
                 loss_ce.backward()
                 optimizer_ce.step()
+                if teacher_ce is not None:
+                    _ema_update_teacher(teacher_ce, student_ce, args._teacher_m)
 
             # --- EMA prototype update (after warmup) ---
             ema_start = min(30, args.epochs - 1)
@@ -370,6 +416,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 optimizer_cl.step()
                 optimizer_part.step()
                 optimizer_gate.step()
+                if teacher_ce is not None:
+                    _ema_update_teacher(teacher_ce, student_ce, args._teacher_m)
             else:
                 optimizer_cl.zero_grad()
                 loss_cl.backward()
@@ -698,6 +746,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 'best_epoch': best_epoch,
                 'pseudo_labeling': args.enable_pseudo_labeling,
                 'pseudo_mode': getattr(args, 'pseudo_mode', 0),
+                'logit_adjust': getattr(args, 'use_logit_adjust', False),
+                'momentum_teacher': getattr(args, 'use_momentum_teacher', False),
             })
         else:
             args.logger.warning('[FINAL EVAL] No best checkpoint found — skipping final report.')
@@ -1834,6 +1884,14 @@ if __name__ == "__main__":
     parser.add_argument('--backbone', type=str, default='dinov2_vitb14',
                         choices=['dino_vitb16', 'dinov2_vitb14', 'dinov2_vitb14_reg'],
                         help='ViT backbone: DINOv1 B/16 or DINOv2 B/14 (default: dinov2_vitb14)')
+    parser.add_argument('--use-logit-adjust', action='store_true', default=False,
+                        help='A4: diem cong tail vao sup CE + fused CE theo tan suat '
+                             'dist_est (tail gap). Tat = legacy.')
+    parser.add_argument('--use-momentum-teacher', action='store_true', default=False,
+                        help='A1: teacher CE rieng update EMA (m0->1 cosine) lam dap an '
+                             'cluster loss thay vi student.detach(). Tat = legacy.')
+    parser.add_argument('--teacher-m0', type=float, default=0.996,
+                        help='A1: momentum khoi dau (cosine -> 1.0 cuoi train).')
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--momentum', type=float, default=0.9)

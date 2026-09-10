@@ -199,6 +199,10 @@ def train(
     backbone: str = "dinov2_vitb14",
     # Train seed: -1 = legacy deterministic (20364); >=0 = explicit repeat seed
     seed: int = -1,
+    # A4/A1 (viec 6): opt-in, default tat de khop run cu
+    use_logit_adjust: bool = False,
+    use_momentum_teacher: bool = False,
+    teacher_m0: float = 0.996,
     # Custom experiment name
     exp_name_suffix: str = "",
 ) -> dict:
@@ -333,6 +337,13 @@ def train(
     if seed is not None and int(seed) >= 0:
         command.extend(["--seed", str(int(seed))])
 
+    # A4/A1: chi truyen khi bat (bacon.py default tat)
+    if use_logit_adjust:
+        command.append("--use-logit-adjust")
+    if use_momentum_teacher:
+        command.append("--use-momentum-teacher")
+        command.extend(["--teacher-m0", str(teacher_m0)])
+
     # AdaPart arguments
     if use_parts:
         command.append("--use-parts")
@@ -466,6 +477,9 @@ def main(
     ablate_concat_eval: bool = False,
     backbone: str = "dinov2_vitb14",
     seed: int = -1,
+    use_logit_adjust: bool = False,
+    use_momentum_teacher: bool = False,
+    teacher_m0: float = 0.996,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -514,6 +528,9 @@ def main(
         ablate_concat_eval=ablate_concat_eval,
         backbone=backbone,
         seed=seed,
+        use_logit_adjust=use_logit_adjust,
+        use_momentum_teacher=use_momentum_teacher,
+        teacher_m0=teacher_m0,
         # Visualization frequency (PCA / t-SNE / confusion matrix)
         vis_freq=vis_freq,
         # Custom experiment name
@@ -574,6 +591,9 @@ def launch(
     ablate_concat_eval: bool = False,
     backbone: str = "dinov2_vitb14",
     seed: int = -1,
+    use_logit_adjust: bool = False,
+    use_momentum_teacher: bool = False,
+    teacher_m0: float = 0.996,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -629,6 +649,9 @@ def launch(
         ablate_concat_eval=ablate_concat_eval,
         backbone=backbone,
         seed=seed,
+        use_logit_adjust=use_logit_adjust,
+        use_momentum_teacher=use_momentum_teacher,
+        teacher_m0=teacher_m0,
         vis_freq=vis_freq,
         exp_name_suffix=exp_name_suffix,
     )

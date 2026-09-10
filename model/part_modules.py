@@ -195,12 +195,18 @@ class PartPrototypeBank(nn.Module):
             P[c] = F.normalize(momentum * P[c] + (1 - momentum) * r_c, dim=-1)
         self.prototypes.copy_(P)
 
-def compute_fused_ce_loss(g_global, g_part, labels, lambda_part=0.5, tau=0.1):
+def compute_fused_ce_loss(g_global, g_part, labels, lambda_part=0.5, tau=0.1,
+                            est_adjustment=None):
     """
     Fused CE loss on labeled data.
+    est_adjustment: optional (C,) logit-adjust vector (A4: tail bonus).
+    None = legacy behavior.
     """
     g_fused = g_global + lambda_part * g_part
-    loss_fused = F.cross_entropy(g_fused / tau, labels)
+    scaled = g_fused / tau
+    if est_adjustment is not None:
+        scaled = scaled - est_adjustment
+    loss_fused = F.cross_entropy(scaled, labels)
     return loss_fused, g_fused
 
 def compute_margin_confidence(g_fused):
