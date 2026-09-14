@@ -29,7 +29,7 @@ def main():
     import torch
 
     if a.dataset == 'aircraft':
-        from data.fgvc_aircraft import AircraftDataset
+        from data.aircraft import AircraftDataset
         from config import aircraft_root
         k = a.k or 80
         split_dir = f'data_uq_idxs/aircraft_k{k}_imb{a.imb}'

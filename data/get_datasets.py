@@ -4,7 +4,7 @@ from data.cifar import get_cifar_10_datasets, get_cifar_100_datasets
 from data.cub import get_cub_200_datasets
 from data.imagenet import get_imagenet_100_datasets
 from data.stanford_cars import get_stanford_cars_datasets
-from data.fgvc_aircraft import get_fgvc_aircraft_datasets
+from data.aircraft import get_fgvc_aircraft_datasets
 from copy import deepcopy
 import pickle
 import os
