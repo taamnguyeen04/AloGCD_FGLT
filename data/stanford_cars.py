@@ -53,8 +53,14 @@ def _load_kaggle_csv(root, train):
     csv_path = os.path.join(root, 'anno_train.csv' if train else 'anno_test.csv')
     df = pd.read_csv(csv_path, header=None)
     # One recursive walk for filename -> full path (16k files, seconds).
+    # CRITICAL: train and test reuse the same filenames (00001.jpg exists in
+    # BOTH), so the walk is scoped to */train/* vs */test/* — an unscoped walk
+    # silently mixes test images into train and vice versa (total collapse).
+    want = 'train' if train else 'test'
     path_by_name = {}
     for dirpath, _, filenames in os.walk(root):
+        if want not in set(p.lower() for p in dirpath.split(os.sep)):
+            continue
         for fn in filenames:
             if fn.lower().endswith(('.jpg', '.jpeg', '.png')):
                 path_by_name.setdefault(fn, os.path.join(dirpath, fn))
