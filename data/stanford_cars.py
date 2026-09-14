@@ -46,31 +46,27 @@ def _load_devkit_mat(mat_path):
 
 
 def _load_kaggle_csv(root, train):
-    """Fallback for jutrera-style dumps (anno_train.csv / anno_test.csv)."""
+    """jutrera-style dump: anno_*.csv WITHOUT header (filename,x1,y1,x2,y2,class
+    1-based) + images under class folders (any depth, e.g. car_data/car_data/
+    train/<class name>/*.jpg). Order = sorted filename (== devkit order)."""
     import pandas as pd
     csv_path = os.path.join(root, 'anno_train.csv' if train else 'anno_test.csv')
-    df = pd.read_csv(csv_path)
-    cols = {c.lower(): c for c in df.columns}
-    fcol = next((cols[c] for c in cols if 'file' in c or 'name' in c or 'image' in c), None)
-    ccol = next((cols[c] for c in cols if 'class' in c or 'label' in c or 'target' in c), None)
-    if fcol is None or ccol is None:
-        raise ValueError(f'{csv_path}: cannot find filename/class columns {list(df.columns)}')
-    names_path = os.path.join(root, 'names.csv')
-    name_to_id = None
-    if os.path.isfile(names_path):
-        names = pd.read_csv(names_path, header=None)[0].tolist()
-        name_to_id = {n: i for i, n in enumerate(names)}
-    raw = []
-    for _, row in df.iterrows():
-        f, c = str(row[fcol]), row[ccol]
-        cid = name_to_id[c] if isinstance(c, str) and name_to_id else int(c)
-        raw.append((os.path.basename(f), int(cid)))
-    # Auto-detect 0-based (max 195) vs 1-based (max 196) class ids.
-    one_based = max(c for _, c in raw) == N_CLASS
-    items = [(f, c - 1 if one_based else c) for f, c in raw]
+    df = pd.read_csv(csv_path, header=None)
+    # One recursive walk for filename -> full path (16k files, seconds).
+    path_by_name = {}
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.lower().endswith(('.jpg', '.jpeg', '.png')):
+                path_by_name.setdefault(fn, os.path.join(dirpath, fn))
+    items = []
+    for fname, cls in zip(df[0].astype(str), df[5].astype(int)):
+        fname = os.path.basename(fname)
+        if fname not in path_by_name:
+            raise FileNotFoundError(f'{fname} ({csv_path}) not found under {root}.')
+        items.append((path_by_name[fname], int(cls) - 1))
     assert all(0 <= c < N_CLASS for _, c in items), 'class ids out of 0..195'
-    items.sort(key=lambda x: x[0])
-    return items
+    items.sort(key=lambda x: os.path.basename(x[0]))
+    return [(p, c) for p, c in items]
 
 
 class CarsDataset(Dataset):
@@ -81,11 +77,13 @@ class CarsDataset(Dataset):
         img_dir = os.path.join(root, 'cars_train' if train else 'cars_test')
         mat = os.path.join(root, 'devkit',
                            'cars_train_annos.mat' if train else 'cars_test_annos_withlabels.mat')
+        use_csv = os.path.isfile(os.path.join(
+            root, 'anno_train.csv' if train else 'anno_test.csv'))
         if os.path.isfile(mat) and os.path.isdir(img_dir):
             items = _load_devkit_mat(mat)
-        elif os.path.isfile(os.path.join(
-                root, 'anno_train.csv' if train else 'anno_test.csv')):
-            items = _load_kaggle_csv(root, train)
+            self.samples = [(os.path.join(img_dir, f), c) for f, c in items]
+        elif use_csv:
+            self.samples = _load_kaggle_csv(root, train)  # full paths already
         else:
             try:
                 seen = sorted(os.listdir(root))
@@ -94,28 +92,14 @@ class CarsDataset(Dataset):
             raise FileNotFoundError(
                 f'No Cars data under {root}. Saw: {seen}. Expected official layout '
                 '(cars_train/, cars_test/, devkit/*.mat) or Kaggle dump (anno_*.csv).')
-            # Resolve full paths against class folders or flat dirs.
-            cand_dirs = [img_dir, root,
-                         *[d for d in glob.glob(os.path.join(root, '*')) if os.path.isdir(d)]]
-            resolved = []
-            for fname, cls in items:
-                hit = next((os.path.join(d, fname) for d in cand_dirs
-                            if os.path.isfile(os.path.join(d, fname))), None)
-                if hit is None:
-                    raise FileNotFoundError(
-                        f'{fname} not found under {root}. Expected official layout '
-                        '(cars_train/, cars_test/, devkit/*.mat).')
-                resolved.append((hit, cls))
-            self.samples = resolved
-            self.targets = [t for _, t in resolved]
-            self.uq_idxs = np.arange(len(resolved))
-            return
-        self.samples = [(os.path.join(img_dir, f), c) for f, c in items]
-        missing = [p for p, _ in self.samples if not os.path.isfile(p)]
-        if missing:
-            raise FileNotFoundError(
-                f'{len(missing)} images missing under {img_dir} (e.g. {missing[0]}). '
-                'Check CARS_ROOT layout.')
+        if use_csv:
+            print(f'[cars] Kaggle-CSV layout: {len(self.samples)} images.')
+        else:
+            missing = [p for p, _ in self.samples if not os.path.isfile(p)]
+            if missing:
+                raise FileNotFoundError(
+                    f'{len(missing)} images missing under {img_dir} (e.g. {missing[0]}). '
+                    'Check CARS_ROOT layout.')
         self.targets = [t for _, t in self.samples]
         self.uq_idxs = np.arange(len(self.samples))
 
