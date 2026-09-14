@@ -36,9 +36,21 @@ class AircraftDataset(Dataset):
             base = FGVCAircraft(root=root, split=split, annotation_level='variant',
                                 transform=None, download=download)
         except Exception as e:
+            # Drop truncated tarballs so the next run retries from zero instead
+            # of choking on the partial file (common on flaky links).
+            import glob as _glob
+            for partial in _glob.glob(os.path.join(root, '*.tgz')) + \
+                    _glob.glob(os.path.join(root, '*.tar.gz')):
+                try:
+                    if os.path.getsize(partial) < 1_000_000_000:
+                        os.remove(partial)
+                        print(f'[aircraft] removed truncated {partial}, retry will re-download.')
+                except OSError:
+                    pass
             raise RuntimeError(
                 f'FGVCAircraft split={split!r} failed under root={root!r}: {e}\n'
-                'Place fgvc-aircraft-2013b/ under AIRCRAFT_ROOT or keep download=True.'
+                'Place fgvc-aircraft-2013b/ under AIRCRAFT_ROOT or keep download=True '
+                'and re-run (partial downloads are auto-removed).'
             )
         self.samples = [(p, int(t)) for p, t in zip(base._image_files, base._labels)]
         self.targets = [t for _, t in self.samples]
