@@ -3,6 +3,8 @@ from data.data_utils import MergedDataset
 from data.cifar import get_cifar_10_datasets, get_cifar_100_datasets
 from data.cub import get_cub_200_datasets
 from data.imagenet import get_imagenet_100_datasets
+from data.stanford_cars import get_stanford_cars_datasets
+from data.fgvc_aircraft import get_fgvc_aircraft_datasets
 from copy import deepcopy
 import pickle
 import os
@@ -13,6 +15,8 @@ get_dataset_funcs = {
     'cifar100': get_cifar_100_datasets,
     'cub200': get_cub_200_datasets,
     'imagenet100': get_imagenet_100_datasets,
+    'stanford_cars': get_stanford_cars_datasets,
+    'fgvc_aircraft': get_fgvc_aircraft_datasets,
 }
 
 
@@ -53,6 +57,12 @@ def get_class_splits(args):
     elif args.dataset_name == 'cub200':
         args.train_classes = range(100)
         args.unlabeled_classes = range(100, 200)
+    elif args.dataset_name == 'stanford_cars':
+        args.train_classes = range(98)
+        args.unlabeled_classes = range(98, 196)
+    elif args.dataset_name == 'fgvc_aircraft':
+        args.train_classes = range(80)
+        args.unlabeled_classes = range(80, 100)
     elif args.dataset_name == 'imagenet100':
         args.train_classes = range(50)
         args.unlabeled_classes = range(50, 100)

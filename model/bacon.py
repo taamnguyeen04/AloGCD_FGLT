@@ -2019,6 +2019,10 @@ if __name__ == "__main__":
         total_class = 10
     elif args.dataset_name == 'cub200':
         total_class = 200
+    elif args.dataset_name == 'stanford_cars':
+        total_class = 196
+    elif args.dataset_name == 'fgvc_aircraft':
+        total_class = 100
     else:
         total_class = 100
 

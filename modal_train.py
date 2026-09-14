@@ -49,6 +49,8 @@ def _run(cmd: list[str], cwd: Path = PROJECT_DIR) -> None:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["CUB_ROOT"] = f"{DATA_DIR}/cub/CUB_200_2011"
+    env["CARS_ROOT"] = f"{DATA_DIR}/cars"
+    env["AIRCRAFT_ROOT"] = f"{DATA_DIR}/aircraft"
     print("$", " ".join(cmd), flush=True)
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
@@ -150,7 +152,7 @@ def _generate_experiment_name(
 
 @app.function(
     image=image,
-    gpu="RTX-PRO-6000",
+    gpu="A100-40GB",  # TEMP-SMOKE: PRO-6000 hết hàng; revert về RTX-PRO-6000 trước runs thật
     timeout=60 * 60 * 24,
     volumes={STORAGE_DIR: storage_volume},
 )
@@ -262,6 +264,12 @@ def train(
         # Ensure CUB directory exists
         cub_dir = Path(f"{DATA_DIR}/cub")
         cub_dir.mkdir(parents=True, exist_ok=True)
+    elif dataset_name == "stanford_cars":
+        labeled_classes = 98
+        Path(f"{DATA_DIR}/cars").mkdir(parents=True, exist_ok=True)
+    elif dataset_name == "fgvc_aircraft":
+        labeled_classes = 80
+        Path(f"{DATA_DIR}/aircraft").mkdir(parents=True, exist_ok=True)
     elif dataset_name == "imagenet100":
         labeled_classes = 50
     else:
