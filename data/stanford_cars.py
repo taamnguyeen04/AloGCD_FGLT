@@ -83,8 +83,17 @@ class CarsDataset(Dataset):
                            'cars_train_annos.mat' if train else 'cars_test_annos_withlabels.mat')
         if os.path.isfile(mat) and os.path.isdir(img_dir):
             items = _load_devkit_mat(mat)
-        else:
+        elif os.path.isfile(os.path.join(
+                root, 'anno_train.csv' if train else 'anno_test.csv')):
             items = _load_kaggle_csv(root, train)
+        else:
+            try:
+                seen = sorted(os.listdir(root))
+            except OSError:
+                seen = ['<unreadable>']
+            raise FileNotFoundError(
+                f'No Cars data under {root}. Saw: {seen}. Expected official layout '
+                '(cars_train/, cars_test/, devkit/*.mat) or Kaggle dump (anno_*.csv).')
             # Resolve full paths against class folders or flat dirs.
             cand_dirs = [img_dir, root,
                          *[d for d in glob.glob(os.path.join(root, '*')) if os.path.isdir(d)]]
