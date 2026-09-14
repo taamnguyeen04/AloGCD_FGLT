@@ -70,34 +70,38 @@ def subsample_classes(dataset, include_classes):
     return subsample_dataset(dataset, cls_idxs)
 
 
-def _validate_against_meta(idxs, targets, split_dir, split_name):
-    """Fail fast if positional indices disagree with the split maker's meta."""
-    idxs = np.asarray(idxs)
-    assert idxs.max() < len(targets), f'{split_name} index out of range'
-    got = Counter(int(t) for t in np.asarray(targets)[idxs])
+def _validate_against_meta(l_k, unl_k, unl_unk, targets, split_dir, known, novel):
+    """Cross-check the UNION against the maker's meta (l_k alone is only ~50%
+    of each known class, so per-file comparison always fails — that was a bug).
+
+    Checks: (l_k + unl_k) == requested per known class; unl_unk == requested
+    per novel class; no overlap between the three files.
+    """
+    t = np.asarray(targets)
+    l_k, unl_k, unl_unk = (np.asarray(x) for x in (l_k, unl_k, unl_unk))
+    for name, idx in (('l_k', l_k), ('unl_k', unl_k), ('unl_unk', unl_unk)):
+        assert idx.max() < len(t), f'{name} index out of range'
+    assert len(set(l_k) & set(unl_k) & set(unl_unk)) == 0, 'split files overlap!'
     meta_path = os.path.join(split_dir, 'split_meta.json')
-    if os.path.isfile(meta_path):
-        meta = json.load(open(meta_path))
-        want = meta.get('requested_counts') or meta.get('actual_counts')
-        if want:
-            want = {int(k): int(v) for k, v in want.items()}
-            # Only classes present in THIS split file are checked.
-            bad = {c: (got.get(c, 0), want[c]) for c in want
-                   if c in set(int(t) for t in np.asarray(targets)[idxs]) and got.get(c, 0) != want[c]}
-            if bad:
-                sample = dict(list(bad.items())[:5])
-                raise ValueError(
-                    f'{split_name}: {len(bad)} class-count mismatches vs {meta_path} '
-                    f'(e.g. {sample}). Loader ordering != maker ordering -> STOP. '
-                    'Ask split author for the maker script or remake splits.')
-            print(f'[aircraft] {split_name}: matches meta ({len(idxs)} imgs, '
-                  f'{len(set(got))} classes).')
-            return got
-    hist = np.bincount(np.asarray(targets)[idxs], minlength=100)
-    assert (hist > 0).all(), f'{split_name}: {(hist == 0).sum()} empty classes'
-    print(f'[aircraft] {split_name}: n={len(idxs)} max={hist.max()} min={hist.min()} '
-          f'(no meta, basic LT check).')
-    return got
+    if not os.path.isfile(meta_path):
+        print('[aircraft] no meta: basic non-empty check only.')
+        return
+    meta = json.load(open(meta_path))
+    want = {int(k): int(v) for k, v in
+            (meta.get('requested_counts') or meta.get('actual_counts')).items()}
+    got_known = Counter(int(c) for c in t[np.concatenate([l_k, unl_k])])
+    got_novel = Counter(int(c) for c in t[unl_unk])
+    bad = {c: (got_known.get(c, 0), want[c]) for c in known
+           if got_known.get(c, 0) != want[c]}
+    bad.update({c: (got_novel.get(c, 0), want[c]) for c in novel
+                if got_novel.get(c, 0) != want[c]})
+    if bad:
+        raise ValueError(
+            f'{len(bad)} class-count mismatches vs {meta_path} '
+            f'(e.g. {dict(list(bad.items())[:5])}). '
+            'Loader ordering != maker ordering -> STOP.')
+    print(f'[aircraft] matches meta: known {len(known)} + novel {len(novel)} classes, '
+          f'n={len(l_k) + len(unl_k) + len(unl_unk)}.')
 
 
 def get_fgvc_aircraft_datasets(train_transform, test_transform, train_classes=range(80), args=None):
@@ -122,9 +126,15 @@ def get_fgvc_aircraft_datasets(train_transform, test_transform, train_classes=ra
     unl_k_pos = torch.load(f'{split_dir}/unl_k_uq_idxs.pt', weights_only=False)
     unl_unk_pos = torch.load(f'{split_dir}/unl_unk_uq_idxs.pt', weights_only=False)
 
-    _validate_against_meta(l_k_pos, whole_training_set.targets, split_dir, 'l_k')
-    _validate_against_meta(unl_k_pos, whole_training_set.targets, split_dir, 'unl_k')
-    _validate_against_meta(unl_unk_pos, whole_training_set.targets, split_dir, 'unl_unk')
+    meta_path = os.path.join(split_dir, 'split_meta.json')
+    if os.path.isfile(meta_path):
+        meta = json.load(open(meta_path))
+        known = [int(c) for c in meta['known_classes']]
+        novel = [int(c) for c in meta['novel_classes']]
+    else:
+        known, novel = list(range(80)), list(range(80, 100))
+    _validate_against_meta(l_k_pos, unl_k_pos, unl_unk_pos,
+                           whole_training_set.targets, split_dir, known, novel)
 
     train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k_pos)
     unlabelled_known_dataset = subsample_dataset(deepcopy(whole_training_set), unl_k_pos)
