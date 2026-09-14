@@ -152,7 +152,7 @@ def _generate_experiment_name(
 
 @app.function(
     image=image,
-    gpu="A100-40GB",  # TEMP-SMOKE: PRO-6000 hết hàng; revert về RTX-PRO-6000 trước runs thật
+    gpu="RTX-PRO-6000",
     timeout=60 * 60 * 24,
     volumes={STORAGE_DIR: storage_volume},
 )
