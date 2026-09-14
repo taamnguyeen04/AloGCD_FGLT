@@ -129,14 +129,24 @@ def subsample_classes(dataset, include_classes):
     return subsample_dataset(dataset, cls_idxs)
 
 
-def _validate_split(idxs, targets, split_dir, split_name):
-    idxs = np.asarray(idxs)
-    assert idxs.max() < len(targets), f'{split_name} index out of range'
-    hist = np.bincount(np.asarray(targets)[idxs], minlength=N_CLASS)
-    assert (hist > 0).all(), f'{split_name}: {(hist == 0).sum()} empty classes'
-    print(f'[cars] {split_name}: n={len(idxs)} max={hist.max()} min={hist.min()} '
+def _validate_cars_splits(l_k, unl_k, unl_unk, targets, split_dir, k):
+    """l_k/unl_k cover the K known classes, unl_unk the novel rest (complement).
+    Per-file full-196 coverage must NOT be required (same bug class as the
+    aircraft per-file check)."""
+    t = np.asarray(targets)
+    l_k, unl_k, unl_unk = (np.asarray(x) for x in (l_k, unl_k, unl_unk))
+    for name, idx in (('l_k', l_k), ('unl_k', unl_k), ('unl_unk', unl_unk)):
+        assert idx.max() < len(t), f'{name} index out of range'
+    assert len(set(l_k) & set(unl_k) & set(unl_unk)) == 0, 'split files overlap!'
+    known = set(int(c) for c in t[np.concatenate([l_k, unl_k])])
+    novel = set(int(c) for c in t[unl_unk])
+    assert known.isdisjoint(novel), f'known/novel overlap: {known & novel}'
+    assert len(known) == k, f'known {len(known)} != k={k}'
+    assert len(novel) == N_CLASS - k, f'novel {len(novel)} != {N_CLASS - k}'
+    hist = np.bincount(t[np.concatenate([l_k, unl_k, unl_unk])], minlength=N_CLASS)
+    print(f'[cars] splits OK: known {len(known)} + novel {len(novel)} classes, '
+          f'n={len(l_k) + len(unl_k) + len(unl_unk)} max={hist.max()} min={hist.min()} '
           f'(from {split_dir})')
-    return hist
 
 
 def get_stanford_cars_datasets(train_transform, test_transform, train_classes=range(98), args=None):
@@ -161,9 +171,8 @@ def get_stanford_cars_datasets(train_transform, test_transform, train_classes=ra
     unl_k_pos = torch.load(f'{split_dir}/unl_k_uq_idxs.pt', weights_only=False)
     unl_unk_pos = torch.load(f'{split_dir}/unl_unk_uq_idxs.pt', weights_only=False)
 
-    _validate_split(l_k_pos, whole_training_set.targets, split_dir, 'l_k')
-    _validate_split(unl_k_pos, whole_training_set.targets, split_dir, 'unl_k')
-    _validate_split(unl_unk_pos, whole_training_set.targets, split_dir, 'unl_unk')
+    _validate_cars_splits(l_k_pos, unl_k_pos, unl_unk_pos,
+                          whole_training_set.targets, split_dir, k)
 
     train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k_pos)
     unlabelled_known_dataset = subsample_dataset(deepcopy(whole_training_set), unl_k_pos)
