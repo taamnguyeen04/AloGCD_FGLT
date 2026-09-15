@@ -558,7 +558,7 @@ def main(
     use_logit_adjust: bool = False,
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
-    early_stop_patience: int = 100,
+    early_stop_patience: int = 50,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -679,7 +679,7 @@ def launch(
     use_logit_adjust: bool = False,
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
-    early_stop_patience: int = 100,
+    early_stop_patience: int = 50,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
