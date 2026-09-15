@@ -139,6 +139,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     args.current_epoch = 0
     best_test_acc_all_cl = -1
     best_epoch = -1
+    epochs_since_best = 0  # early-stop counter (test rounds without new best)
 
     # ----------------------
     # ADAPART MODULE INIT
@@ -681,8 +682,11 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             args._part_module_ref = part_module
             args._part_bank_ref = part_bank
 
+        if epoch % args.test_freq == 0:
+            epochs_since_best += 1
         if epoch % args.test_freq == 0 and all_acc_test_cl > best_test_acc_all_cl:
 
+            epochs_since_best = 0  # reset early-stop counter
             best_test_acc_new_cl = new_acc_test_cl
             best_test_acc_old_cl = old_acc_test_cl
             best_test_acc_all_cl = all_acc_test_cl
@@ -704,6 +708,14 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
             torch.save(save_dict_cl, save_path + f'/model_epoch{epoch}.pt')
             args.logger.info("model saved to {}.".format(save_path))
+
+        _esp = int(getattr(args, 'early_stop_patience', 0) or 0)
+        if _esp > 0 and epochs_since_best >= _esp:
+            args.logger.info(
+                f'[EARLY-STOP] no new best for {_esp} test rounds '
+                f'(best_ep={best_epoch}, best_all={best_test_acc_all_cl:.1f}). '
+                'Stopping, keeping best checkpoint + final report.')
+            break
 
         if epoch >= args.stop_epoch:
             break
@@ -1911,6 +1923,11 @@ if __name__ == "__main__":
                              'cluster loss thay vi student.detach(). Tat = legacy.')
     parser.add_argument('--teacher-m0', type=float, default=0.996,
                         help='A1: momentum khoi dau (cosine -> 1.0 cuoi train).')
+    parser.add_argument('--early-stop-patience', type=int, default=100,
+                        help='Dung train sau N test-rounds lien tiep khong co best moi '
+                             '(giu best checkpoint + chay final report). 0 = tat. '
+                             'Default 100: chi cat runs giậm chân (collapse), runs khoe '
+                             'best <= ep100 khong anh huong.')
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--momentum', type=float, default=0.9)

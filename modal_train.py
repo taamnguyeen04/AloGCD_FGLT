@@ -205,6 +205,8 @@ def train(
     use_logit_adjust: bool = False,
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    # Early stopping: dung sau N test-rounds khong best moi (0 = tat)
+    early_stop_patience: int = 100,
     # Custom experiment name
     exp_name_suffix: str = "",
 ) -> dict:
@@ -345,6 +347,9 @@ def train(
     if seed is not None and int(seed) >= 0:
         command.extend(["--seed", str(int(seed))])
 
+    # Early stopping (default 100 test rounds, 0 = tat)
+    command.extend(["--early-stop-patience", str(int(early_stop_patience))])
+
     # A4/A1: chi truyen khi bat (bacon.py default tat)
     if use_logit_adjust:
         command.append("--use-logit-adjust")
@@ -444,6 +449,72 @@ def _download_visualizations(experiment_name: str) -> None:
         print(f"\nResults saved to: {local_dir}\n")
 
 
+def _short_exp_name(experiment_name: str) -> str:
+    """Strip trailing _YYYYMMDD_HHMMSS so local exp/ matches repo convention."""
+    import re
+    return re.sub(r"_\d{8}_\d{6}$", "", experiment_name)
+
+
+def _download_results(experiment_name: str) -> None:
+    """Download logs/final_report/test_history/pseudo_events to local exp/<short>/.
+
+    Works from ANY machine/workspace sharing the Modal account: results live on
+    the shared volume, not in the launching terminal. Checkpoints (*.pt, ~800MB)
+    are SKIPPED — fetch manually:
+      modal volume get bacon-storage "outputs/experiments/<exp>/checkpoints/model_epoch<N>.pt" ckpts/
+    """
+    import asyncio
+
+    remote_exp_dir = f"{EXPERIMENTS_DIR}/{experiment_name}"
+    local_dir = Path("exp") / _short_exp_name(experiment_name)
+    keep_names = {"final_report.csv", "final_report.txt", "log.txt",
+                  "test_history.json", "pseudo_events.json", "base.csv"}
+
+    async def _fetch() -> int:
+        from modal.volume import FileEntryType
+
+        count = 0
+        entries = [e async for e in storage_volume.listdir(remote_exp_dir, recursive=True)]
+        wanted = [e for e in entries if e.type == FileEntryType.FILE
+                  and PurePosixPath(str(e.path)).name in keep_names
+                  and "checkpoints" not in str(e.path)]
+        if not wanted:
+            print(f"[results] Nothing found under {remote_exp_dir}.")
+            return 0
+        for e in wanted:
+            entry_path = PurePosixPath(str(e.path))
+            try:
+                rel = entry_path.relative_to(remote_exp_dir.lstrip("/"))
+            except ValueError:
+                rel = entry_path.relative_to("/") if entry_path.is_absolute() else entry_path
+            # Flatten logs/ into exp root (repo convention: exp/<run>/log.txt).
+            name = entry_path.name
+            dest = local_dir / name
+            if dest.exists():
+                print(f"[results] skip (exists): {name}")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(dest, "wb") as fp:
+                    async for chunk in storage_volume.read_file(str(e.path)):
+                        fp.write(chunk)
+                print(f"[results] {name}")
+                count += 1
+            except Exception as err:
+                print(f"[results] FAILED {name}: {err}")
+        return count
+
+    try:
+        got = asyncio.run(_fetch())
+    except Exception as e:
+        print(f"[results] Could not access volume ({e}). Manual fetch:")
+        print(f"  modal volume get bacon-storage \"{remote_exp_dir}\" \"exp/{_short_exp_name(experiment_name)}\"")
+        return
+
+    if got:
+        print(f"\nResults saved to: {local_dir}\n")
+
+
 @app.local_entrypoint()
 def main(
     dataset_name: str = "cifar100",
@@ -488,12 +559,15 @@ def main(
     use_logit_adjust: bool = False,
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    early_stop_patience: int = 100,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
     vis_freq: int = 10,
     # Download visualizations to local machine after training
     download_vis: bool = True,
+    # Download results (logs/final_report/test_history) after training
+    download_results: bool = True,
 ) -> None:
     """Local entry point for training."""
     parsed_extra_args = extra_args.split() if extra_args else []
@@ -539,11 +613,15 @@ def main(
         use_logit_adjust=use_logit_adjust,
         use_momentum_teacher=use_momentum_teacher,
         teacher_m0=teacher_m0,
+        early_stop_patience=early_stop_patience,
         # Visualization frequency (PCA / t-SNE / confusion matrix)
         vis_freq=vis_freq,
         # Custom experiment name
         exp_name_suffix=exp_name_suffix,
     )
+
+    if download_results:
+        _download_results(result['experiment_name'])
 
     print(f"\n{'='*60}")
     print("Training completed!")
@@ -602,6 +680,7 @@ def launch(
     use_logit_adjust: bool = False,
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    early_stop_patience: int = 100,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
@@ -660,6 +739,7 @@ def launch(
         use_logit_adjust=use_logit_adjust,
         use_momentum_teacher=use_momentum_teacher,
         teacher_m0=teacher_m0,
+        early_stop_patience=early_stop_patience,
         vis_freq=vis_freq,
         exp_name_suffix=exp_name_suffix,
     )
@@ -671,9 +751,33 @@ def launch(
     print("List apps:     modal app list")
     print("Stop manually: modal app stop bacon-train")
     print()
+    print("FETCH RESULTS (from THIS or ANY other machine/ws on your account,")
+    print("after the run finishes — volume is shared, terminal is not):")
+    print("  modal volume ls bacon-storage outputs/experiments | tail -5")
+    print("  modal run modal_train.py::fetch --exp-name <full_exp_dir_name>")
+    print("  (downloads final_report/log/test_history into local exp/<short>/)")
+    print()
     print("NOTE: if you did not pass --detach (-d) to 'modal run', this app")
     print("was already torn down when the entrypoint returned. Re-run with:")
     print("  modal run -d modal_train.py::launch ...")
+
+
+@app.local_entrypoint()
+def fetch(exp_name: str = "") -> None:
+    """Download results of a FINISHED run by full experiment dir name.
+
+    Works from any workspace/machine on the same Modal account (ws1 -> ws2 OK):
+    results live on the shared volume, not in the launching terminal.
+
+        modal volume ls bacon-storage outputs/experiments | tail -5
+        modal run modal_train.py::fetch --exp-name <full_name>
+    """
+    if not exp_name:
+        print("Usage: modal run modal_train.py::fetch --exp-name <full_exp_dir_name>")
+        print("Find names with: modal volume ls bacon-storage outputs/experiments")
+        return
+    _download_results(exp_name)
+    _download_visualizations(exp_name)
 
 
 if __name__ == "__main__":
