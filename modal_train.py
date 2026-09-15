@@ -207,6 +207,10 @@ def train(
     teacher_m0: float = 0.996,
     # Early stopping: dung sau N test-rounds khong best moi (0 = tat)
     early_stop_patience: int = 50,
+    # Resume: duong dan .pt tren volume de train tiep ('' = train moi)
+    resume_ckpt: str = "",
+    # Gioi han gio train (0 = tat) — dung nhe + final report khi het gio
+    time_budget_hours: float = 0,
     # Custom experiment name
     exp_name_suffix: str = "",
 ) -> dict:
@@ -347,8 +351,14 @@ def train(
     if seed is not None and int(seed) >= 0:
         command.extend(["--seed", str(int(seed))])
 
-    # Early stopping (default 100 test rounds, 0 = tat)
+    # Early stopping (default 50 test rounds, 0 = tat)
     command.extend(["--early-stop-patience", str(int(early_stop_patience))])
+
+    # Resume + time budget (chi truyen khi dat)
+    if resume_ckpt:
+        command.extend(["--resume", str(resume_ckpt)])
+    if time_budget_hours and float(time_budget_hours) > 0:
+        command.extend(["--time-budget-hours", str(float(time_budget_hours))])
 
     # A4/A1: chi truyen khi bat (bacon.py default tat)
     if use_logit_adjust:
@@ -613,6 +623,8 @@ def main(
         use_momentum_teacher=use_momentum_teacher,
         teacher_m0=teacher_m0,
         early_stop_patience=early_stop_patience,
+        resume_ckpt=resume_ckpt,
+        time_budget_hours=time_budget_hours,
         # Visualization frequency (PCA / t-SNE / confusion matrix)
         vis_freq=vis_freq,
         # Custom experiment name
@@ -739,6 +751,8 @@ def launch(
         use_momentum_teacher=use_momentum_teacher,
         teacher_m0=teacher_m0,
         early_stop_patience=early_stop_patience,
+        resume_ckpt=resume_ckpt,
+        time_budget_hours=time_budget_hours,
         vis_freq=vis_freq,
         exp_name_suffix=exp_name_suffix,
     )

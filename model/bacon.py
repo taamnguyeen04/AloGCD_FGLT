@@ -140,6 +140,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     best_test_acc_all_cl = -1
     best_epoch = -1
     epochs_since_best = 0  # early-stop counter (test rounds without new best)
+    start_epoch = 0  # resume may push forward
 
     # ----------------------
     # ADAPART MODULE INIT
@@ -228,6 +229,76 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                                  s=getattr(args, 'novel_min_size', 10)))
         else:
             args.logger.info("[NOVEL-PSEUDO] Disabled - known-only selection (D1).")
+    # ----------------------
+    # RESUME (legacy-checkpoint compatible)
+    # ----------------------
+    _resume_path = getattr(args, 'resume', '') or ''
+    if _resume_path:
+        import re as _re
+        args.logger.info(f'[RESUME] Loading {_resume_path}')
+        _ckpt = torch.load(_resume_path, map_location=device)
+        ce_backbone.load_state_dict(_ckpt['ce_backbone'])
+        ce_head.load_state_dict(_ckpt['ce_head'])
+        cl_backbone.load_state_dict(_ckpt['cl_backbone'])
+        cl_head.load_state_dict(_ckpt['cl_head'])
+        if part_module is not None and _ckpt.get('part_module') is not None:
+            part_module.load_state_dict(_ckpt['part_module'])
+        if part_bank is not None and _ckpt.get('part_bank') is not None:
+            part_bank.load_state_dict(_ckpt['part_bank'])
+        # Epoch: saved value, else parsed from model_epoch<N>.pt filename.
+        if 'epoch' in _ckpt:
+            start_epoch = int(_ckpt['epoch']) + 1
+        else:
+            _m = _re.search(r'model_epoch(\d+)\.pt', _resume_path)
+            start_epoch = int(_m.group(1)) + 1 if _m else 0
+        # Optimizer/scheduler states (new-format ckpts); legacy -> fresh
+        # optimizers (momentum reset, documented) + schedulers fast-forwarded.
+        for _opt, _key in ((optimizer_ce, 'opt_ce'), (optimizer_cl, 'opt_cl')):
+            if _ckpt.get(_key) is not None:
+                try:
+                    _opt.load_state_dict(_ckpt[_key])
+                except Exception as e:
+                    args.logger.warning(f'[RESUME] skip {_key}: {e}')
+        for _sch, _key in ((exp_lr_scheduler_ce, 'sch_ce'),
+                           (exp_lr_scheduler_cl, 'sch_cl'),
+                           (scheduler_part, 'sch_part'),
+                           (scheduler_gate, 'sch_gate')):
+            if _sch is None:
+                continue
+            if _ckpt.get(_key) is not None:
+                try:
+                    _sch.load_state_dict(_ckpt[_key])
+                except Exception as e:
+                    args.logger.warning(f'[RESUME] skip {_key}: {e}')
+            else:
+                _sch.last_epoch = start_epoch - 1
+        # Best scores: restored if present, else re-discovered (old best .pt
+        # file stays on disk and is never overwritten by a different epoch).
+        best_epoch = int(_ckpt.get('best_epoch', -1))
+        best_test_acc_all_cl = float(_ckpt.get('best_all', -1))
+        # Teacher must mirror the LOADED student, not the init weights.
+        if teacher_ce is not None:
+            teacher_ce = _build_teacher_ce(student_ce, args, device)
+            args.logger.info('[RESUME] teacher rebuilt from loaded student '
+                             '(~1 epoch EMA discontinuity, negligible).')
+        # Pseudo counters: skip iters whose window already passed so promoted
+        # samples are not duplicated.
+        if getattr(args, 'enable_pseudo_labeling', False):
+            _pw, _pf, _pm = (getattr(args, 'pseudo_warmup_epoch', 30),
+                             getattr(args, 'pseudo_update_freq', 10),
+                             getattr(args, 'max_pseudo_iterations', 3))
+            pseudo_iteration = sum(1 for i in range(_pm) if _pw + i * _pf <= start_epoch)
+        if getattr(args, 'enable_novel_pseudo', False):
+            _nw, _nf, _nm = (getattr(args, 'novel_warmup_epoch', 50),
+                             getattr(args, 'novel_update_freq', 10),
+                             getattr(args, 'max_novel_iterations', 2))
+            args._novel_iteration = sum(1 for i in range(_nm) if _nw + i * _nf <= start_epoch)
+        args.logger.info(f'[RESUME] start_epoch={start_epoch} best_ep={best_epoch} '
+                         f'best_all={best_test_acc_all_cl:.2f}')
+
+    import time as _time
+    args._train_t0 = _time.time()
+
     cluster_criterion = DistillLoss(
         args.warmup_teacher_temp_epochs,
         args.epochs,
@@ -242,7 +313,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     set_model(train=True)
 
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         args.current_epoch = epoch
         # A1: momentum theo lich cosine (chi dung khi teacher bat)
         args._teacher_m = _teacher_momentum(epoch, args.epochs, teacher_m0)
@@ -693,6 +764,19 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             best_epoch = epoch
 
             save_dict_cl = {
+                'epoch': epoch,
+                'best_epoch': epoch,
+                'best_all': float(all_acc_test_cl),
+                'best_old': float(old_acc_test_cl),
+                'best_new': float(new_acc_test_cl),
+                'opt_ce': optimizer_ce.state_dict(),
+                'opt_cl': optimizer_cl.state_dict(),
+                'sch_ce': exp_lr_scheduler_ce.state_dict(),
+                'sch_cl': exp_lr_scheduler_cl.state_dict(),
+                'sch_part': (scheduler_part.state_dict()
+                             if scheduler_part is not None else None),
+                'sch_gate': (scheduler_gate.state_dict()
+                             if scheduler_gate is not None else None),
                 'ce_backbone': ce_backbone.state_dict(),
                 'ce_head': ce_head.state_dict(),
                 'cl_backbone': cl_backbone.state_dict(),
@@ -715,6 +799,13 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 f'[EARLY-STOP] no new best for {_esp} test rounds '
                 f'(best_ep={best_epoch}, best_all={best_test_acc_all_cl:.1f}). '
                 'Stopping, keeping best checkpoint + final report.')
+            break
+
+        _tb = float(getattr(args, 'time_budget_hours', 0) or 0)
+        if _tb > 0 and (_time.time() - args._train_t0) / 3600.0 >= _tb:
+            args.logger.info(
+                f'[TIME-BUDGET] {_tb}h reached at ep{epoch} '
+                f'(best_ep={best_epoch}). Stopping gracefully + final report.')
             break
 
         if epoch >= args.stop_epoch:
@@ -1927,6 +2018,12 @@ if __name__ == "__main__":
                         help='Dung train sau N test-rounds lien tiep khong co best moi '
                              '(giu best checkpoint + chay final report). 0 = tat. '
                              'Voi test_freq=1 thi N rounds = N epochs.')
+    parser.add_argument('--resume', type=str, default='',
+                        help='Duong dan checkpoint .pt de train tiep (tiep epoch, giu '
+                             'best da biet). Cuu runs bi preempt.')
+    parser.add_argument('--time-budget-hours', type=float, default=0,
+                        help='Gioi han gio train (0 = tat). Het gio thi dung nhe nhang '
+                             '+ chay final report, khong mat best.')
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--momentum', type=float, default=0.9)
