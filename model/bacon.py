@@ -1923,11 +1923,10 @@ if __name__ == "__main__":
                              'cluster loss thay vi student.detach(). Tat = legacy.')
     parser.add_argument('--teacher-m0', type=float, default=0.996,
                         help='A1: momentum khoi dau (cosine -> 1.0 cuoi train).')
-    parser.add_argument('--early-stop-patience', type=int, default=100,
+    parser.add_argument('--early-stop-patience', type=int, default=50,
                         help='Dung train sau N test-rounds lien tiep khong co best moi '
                              '(giu best checkpoint + chay final report). 0 = tat. '
-                             'Default 100: chi cat runs giậm chân (collapse), runs khoe '
-                             'best <= ep100 khong anh huong.')
+                             'Voi test_freq=1 thi N rounds = N epochs.')
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--momentum', type=float, default=0.9)

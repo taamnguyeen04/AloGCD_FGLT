@@ -206,7 +206,7 @@ def train(
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
     # Early stopping: dung sau N test-rounds khong best moi (0 = tat)
-    early_stop_patience: int = 100,
+    early_stop_patience: int = 50,
     # Custom experiment name
     exp_name_suffix: str = "",
 ) -> dict:
@@ -467,8 +467,7 @@ def _download_results(experiment_name: str) -> None:
 
     remote_exp_dir = f"{EXPERIMENTS_DIR}/{experiment_name}"
     local_dir = Path("exp") / _short_exp_name(experiment_name)
-    keep_names = {"final_report.csv", "final_report.txt", "log.txt",
-                  "test_history.json", "pseudo_events.json", "base.csv"}
+    keep_names = {"final_report.csv", "log.txt"}
 
     async def _fetch() -> int:
         from modal.volume import FileEntryType
