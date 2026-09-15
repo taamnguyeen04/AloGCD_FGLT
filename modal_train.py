@@ -692,6 +692,8 @@ def launch(
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
     early_stop_patience: int = 50,
+    resume_ckpt: str = "",
+    time_budget_hours: float = 0,
     # Custom experiment name
     exp_name_suffix: str = "",
     # Visualization frequency (0 = off)
