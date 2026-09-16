@@ -152,7 +152,7 @@ def _generate_experiment_name(
 
 @app.function(
     image=image,
-    gpu="A100-80GB",  # TEMP: PRO-6000 hết hàng; về lại RTX-PRO-6000 khi có hàng
+    gpu="RTX-PRO-6000",  # default team: 96GB VRAM, giá giữa; H100 khi cần wall-clock nhanh nhất
     timeout=60 * 60 * 24,
     volumes={STORAGE_DIR: storage_volume},
 )
