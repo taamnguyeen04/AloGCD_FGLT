@@ -416,6 +416,7 @@ __marimo__/
 # Project data and logs
 logs/
 ablation/
+imagenet100/
 
 # Model Checkpoints
 *.pt
@@ -428,3 +429,4 @@ ablation/
 !README.md
 !**/README.md
 dev_outputs
+paper

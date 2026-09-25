@@ -61,11 +61,30 @@ class AircraftDataset(Dataset):
 
     def __getitem__(self, index):
         path, target = self.samples[index]
-        with open(path, 'rb') as f:
-            image = Image.open(f).convert('RGB')
+        image = _open_image_robust(path)
         if self.transform is not None:
             image = self.transform(image)
         return image, target, int(self.uq_idxs[index])
+
+
+def _open_image_robust(path, retries=3):
+    """Doc anh chiu loi transient cua Modal volume (FUSE): sau (re)start
+    container, fp.read() thi thoang tra EINVAL mot vai lan roi het.
+    Retry thay vi de ca run chet."""
+    import io
+    import time
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+            image = Image.open(io.BytesIO(data)).convert('RGB')
+            image.load()
+            return image
+        except OSError as e:
+            last_err = e
+            time.sleep(1.0 * (attempt + 1))
+    raise OSError(f'Failed to read image after {retries} tries: {path} ({last_err})')
 
 
 def subsample_dataset(dataset, idxs):

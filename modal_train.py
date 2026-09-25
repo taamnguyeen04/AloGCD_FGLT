@@ -44,7 +44,35 @@ image = (
 storage_volume = modal.Volume.from_name("bacon-storage", create_if_missing=True)
 
 
+def _restart_marker_path(suffix: str) -> Path:
+    """Marker chong auto-restart sau preemption (1 file / exp_name_suffix)."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", suffix or "nosuffix")
+    d = Path(OUTPUT_DIR) / ".restart_markers"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{safe}.marker"
+
+
+def _find_latest_ckpt_for_suffix(suffix: str) -> str:
+    """Tim model_epoch<N>.pt moi nhat trong cac exp dir cu co ten chua `suffix`
+    (preemption restart se tao dir timestamp moi, can resume tu dir cu)."""
+    import re
+    if not suffix:
+        return ""
+    exp_root = Path(EXPERIMENTS_DIR)
+    if not exp_root.is_dir():
+        return ""
+    best, best_ep = "", -1
+    for ckpt in exp_root.glob(f"*{suffix}*/checkpoints/model_epoch*.pt"):
+        m = re.search(r"model_epoch(\d+)\.pt", ckpt.name)
+        ep = int(m.group(1)) if m else -1
+        if ep > best_ep:
+            best, best_ep = str(ckpt), ep
+    return best
+
+
 def _run(cmd: list[str], cwd: Path = PROJECT_DIR) -> None:
+    import threading
     log_path = Path(OUTPUT_DIR) / "last_train.log"
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -52,26 +80,48 @@ def _run(cmd: list[str], cwd: Path = PROJECT_DIR) -> None:
     env["CARS_ROOT"] = f"{DATA_DIR}/cars"
     env["AIRCRAFT_ROOT"] = f"{DATA_DIR}/aircraft"
     print("$", " ".join(cmd), flush=True)
-    with log_path.open("w", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        lines = []
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log_file.write(line)
-            log_file.flush()
-            lines.append(line)
-            if len(lines) > 200:
-                lines.pop(0)
-        return_code = process.wait()
+    # Commit volume dinh ky: preemption (A10G) giua chung van giu duoc
+    # checkpoint tren volume de lan restart sau auto-resume.
+    stop_commit = threading.Event()
+
+    def _periodic_commit() -> None:
+        while not stop_commit.wait(600):
+            try:
+                storage_volume.commit()
+                print("[volume] periodic commit done", flush=True)
+            except Exception as e:
+                print(f"[volume] periodic commit failed: {e}", flush=True)
+
+    commit_thread = threading.Thread(target=_periodic_commit, daemon=True)
+    commit_thread.start()
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            lines = []
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log_file.write(line)
+                log_file.flush()
+                lines.append(line)
+                if len(lines) > 200:
+                    lines.pop(0)
+            return_code = process.wait()
+    finally:
+        stop_commit.set()
+        try:
+            storage_volume.commit()
+            print("[volume] final commit done", flush=True)
+        except Exception as e:
+            print(f"[volume] final commit failed: {e}", flush=True)
     if return_code != 0:
         print("\nLast 200 training log lines:\n", flush=True)
         print("".join(lines), flush=True)
@@ -152,7 +202,7 @@ def _generate_experiment_name(
 
 @app.function(
     image=image,
-    gpu="RTX-PRO-6000",  # default team: 96GB VRAM, giá giữa; H100 khi cần wall-clock nhanh nhất
+    gpu="A100-80GB",  # 80GB VRAM — batch_size 1024 vua (paper-comparable); nhieu hang hon RTX-PRO-6000
     timeout=60 * 60 * 24,
     volumes={STORAGE_DIR: storage_volume},
 )
@@ -213,8 +263,36 @@ def train(
     time_budget_hours: float = 0,
     # Custom experiment name
     exp_name_suffix: str = "",
+    # Stop-on-preemption (default False = DUNG khi bi restart sau preemption,
+    # thay vi train lai tu dau ton tien). Muon resume-mode thi --allow-restart.
+    allow_restart: bool = False,
 ) -> dict:
     """Train BaCon model with optional pseudo labeling."""
+
+    # Stop-on-preemption: Modal restart train() voi cung input sau preemption.
+    # Lan chay dau de lai marker tren volume; lan restart thay marker -> xoa
+    # marker + thoat ngay (exit sach, khong train lai). Relauch tay sau nay
+    # khong thay marker nen chay binh thuong.
+    if not allow_restart and exp_name_suffix:
+        _rg_marker = _restart_marker_path(exp_name_suffix)
+        try:
+            storage_volume.reload()
+        except Exception:
+            pass
+        if _rg_marker.exists():
+            try:
+                _rg_marker.unlink()
+                storage_volume.commit()
+            except Exception as e:
+                print(f"[restart-guard] cleanup failed: {e}", flush=True)
+            print("[restart-guard] Phat hien auto-restart sau preemption "
+                  "-> dung luon (khong train lai).", flush=True)
+            return {"status": "stopped_on_restart", "suffix": exp_name_suffix}
+        _rg_marker.touch()
+        try:
+            storage_volume.commit()
+        except Exception as e:
+            print(f"[restart-guard] marker commit failed: {e}", flush=True)
 
     # Modal chi convert _ -> - o TEN co, VALUE giu nguyen -> user go
     # 'dinov2-vitb14' van chay duoc (chuan hoa ve underscore cua bacon.py).
@@ -354,6 +432,14 @@ def train(
     # Early stopping (default 50 test rounds, 0 = tat)
     command.extend(["--early-stop-patience", str(int(early_stop_patience))])
 
+    # Auto-resume sau preemption (chi khi --allow-restart): restart tao dir
+    # timestamp moi, tim checkpoint moi nhat cua dir cu co cung exp_name_suffix
+    # de train tiep (bacon.py da ho tro --resume).
+    if allow_restart and not resume_ckpt and exp_name_suffix:
+        auto_ckpt = _find_latest_ckpt_for_suffix(exp_name_suffix)
+        if auto_ckpt:
+            resume_ckpt = auto_ckpt
+            print(f"[RESUME] auto-resume from {resume_ckpt}", flush=True)
     # Resume + time budget (chi truyen khi dat)
     if resume_ckpt:
         command.extend(["--resume", str(resume_ckpt)])
@@ -571,6 +657,8 @@ def main(
     early_stop_patience: int = 50,
     # Custom experiment name
     exp_name_suffix: str = "",
+    # Stop-on-preemption (False = dung khi restart, True = resume-mode)
+    allow_restart: bool = False,
     # Visualization frequency (0 = off)
     vis_freq: int = 10,
     # Download visualizations to local machine after training
@@ -629,7 +717,13 @@ def main(
         vis_freq=vis_freq,
         # Custom experiment name
         exp_name_suffix=exp_name_suffix,
+        allow_restart=allow_restart,
     )
+
+    if result.get('status') == 'stopped_on_restart':
+        print("\nRun stopped on post-preemption restart (no retrain). "
+              "Relaunch manually when ready.")
+        return
 
     if download_results:
         _download_results(result['experiment_name'])
@@ -696,6 +790,8 @@ def launch(
     time_budget_hours: float = 0,
     # Custom experiment name
     exp_name_suffix: str = "",
+    # Stop-on-preemption (False = dung khi restart, True = resume-mode)
+    allow_restart: bool = False,
     # Visualization frequency (0 = off)
     vis_freq: int = 10,
 ) -> None:
@@ -757,6 +853,7 @@ def launch(
         time_budget_hours=time_budget_hours,
         vis_freq=vis_freq,
         exp_name_suffix=exp_name_suffix,
+        allow_restart=allow_restart,
     )
     print("\n" + "=" * 60)
     print(f"Spawned detached Modal run (call id: {call.object_id})")
