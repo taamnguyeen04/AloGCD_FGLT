@@ -1,0 +1,34 @@
+{
+  "dataset": "inat2018",
+  "split_name": "inat2018_k4071_natural",
+  "imb_ratio": 500,
+  "seed": 416,
+  "img_max": 1000,
+  "anno_ratio": 50.0,
+  "num_classes": 8142,
+  "num_known_classes": 4071,
+  "counts_summary": {
+    "l_k": 130382,
+    "unl_k": 130319,
+    "unl_unk": 176812,
+    "total_train": 437513
+  },
+  "buckets": {
+    "K": [
+      1282,
+      1570,
+      1219
+    ],
+    "U": [
+      1300,
+      1425,
+      1346
+    ]
+  },
+  "bucket_thresholds": {
+    "K_mt": 27,
+    "K_ft": 18,
+    "U_mt": 26,
+    "U_ft": 18
+  }
+}

@@ -24,13 +24,15 @@ def dist_est(ce_backbone, cl_backbone, ce_head, train_loader_test_trans, args, d
             images = images.cuda(non_blocking=True)
             class_labels, mask_lab_ = class_labels.cuda(non_blocking=True), mask_lab_.cuda(
                 non_blocking=True).bool()
-            cl_backbone_feature = cl_backbone(images)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                cl_backbone_feature = cl_backbone(images)
 
             uq_idxs = np.append(uq_idxs, uq_idxs_.cpu().numpy())
             targets = np.append(targets, class_labels.cpu().numpy())
             mask_lab = np.append(mask_lab, mask_lab_.cpu().bool().numpy())
 
-            cl_feats = torch.nn.functional.normalize(cl_backbone_feature, dim=-1)
+            cl_feats = torch.nn.functional.normalize(cl_backbone_feature.float(), dim=-1)
             all_feats_cl.append(cl_feats.detach().cpu().numpy())
 
         mask_lab = mask_lab.astype(bool)

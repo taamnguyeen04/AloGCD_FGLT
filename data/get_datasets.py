@@ -5,6 +5,7 @@ from data.cub import get_cub_200_datasets
 from data.imagenet import get_imagenet_100_datasets
 from data.stanford_cars import get_stanford_cars_datasets
 from data.aircraft import get_fgvc_aircraft_datasets
+from data.herbarium19 import get_herbarium_19_datasets
 from copy import deepcopy
 import pickle
 import os
@@ -17,6 +18,11 @@ get_dataset_funcs = {
     'imagenet100': get_imagenet_100_datasets,
     'stanford_cars': get_stanford_cars_datasets,
     'fgvc_aircraft': get_fgvc_aircraft_datasets,
+    'herbarium19': get_herbarium_19_datasets,
+    'herbarium_19': get_herbarium_19_datasets,
+    'herb19': get_herbarium_19_datasets,
+    'her19': get_herbarium_19_datasets,
+    'herbarium': get_herbarium_19_datasets,
 }
 
 
@@ -66,6 +72,9 @@ def get_class_splits(args):
     elif args.dataset_name == 'imagenet100':
         args.train_classes = range(50)
         args.unlabeled_classes = range(50, 100)
+    elif args.dataset_name in ('herbarium19', 'herbarium_19', 'herb19', 'her19', 'herbarium'):
+        args.train_classes = range(341)
+        args.unlabeled_classes = range(341, 683)
 
 
     return args

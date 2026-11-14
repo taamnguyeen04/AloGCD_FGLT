@@ -62,6 +62,17 @@ def _teacher_momentum(epoch, epochs, m0=0.996):
 @torch.no_grad()
 def _ema_update_teacher(teacher_ce, student_ce, m):
     """teacher <- m*teacher + (1-m)*student. Khong gradient, khong optimizer."""
+    # foreach: 2 kernel launch cho ca cay tham so thay vi 2*N -> EMA chay moi
+    # step nen tiet kiem du ke. Fallback vong for neu foreach khong kha dung.
+    params_t = list(teacher_ce.parameters())
+    params_s = [p.detach() for p in student_ce.parameters()]
+    if len(params_t) == len(params_s) and params_t:
+        try:
+            torch._foreach_mul_(params_t, m)
+            torch._foreach_add_(params_t, params_s, alpha=1.0 - m)
+            return
+        except Exception:
+            pass
     for pt, ps in zip(teacher_ce.parameters(), student_ce.parameters()):
         pt.mul_(m).add_(ps.detach(), alpha=1.0 - m)
 
@@ -88,9 +99,27 @@ def _build_teacher_ce(student_ce, args, device):
     return teacher_ce
 
 
+def _log_eval_compact(args, tag, epoch, all_acc, old_acc, new_acc, acc_list,
+                      nmi=None, ari=None, breakdown_label='Test'):
+    """Log 1 eval round giong style prototail: 1 dong headline greppable
+    (`[<tag> EVAL] Epoch N: ...`) + dong shot breakdown many/med/few."""
+    h = (2.0 * old_acc * new_acc / (old_acc + new_acc)) \
+        if (old_acc is not None and new_acc is not None and (old_acc + new_acc) > 0) else 0.0
+    args.logger.info(f'[{tag} EVAL] Epoch {epoch}: All {all_acc:.2f} | Known {old_acc:.2f} | '
+                     f'Novel {new_acc:.2f} | H-Score {h:.2f}')
+    args.logger.info(
+        f'  Shot Breakdown ({breakdown_label}): Known [Many: {acc_list[0]:.2f}, '
+        f'Med: {acc_list[1]:.2f}, Few: {acc_list[2]:.2f}] | '
+        f'Novel [Many: {acc_list[3]:.2f}, Med: {acc_list[4]:.2f}, Few: {acc_list[5]:.2f}]')
+    if nmi is not None or ari is not None:
+        nmi_str = f'{nmi:.3f}' if nmi is not None else 'n/a'
+        ari_str = f'{ari:.3f}' if ari is not None else 'n/a'
+        args.logger.info(f'  Clustering structure: NMI {nmi_str} | ARI {ari_str}')
+    return h
 
 
-def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_loader, args):
+def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_loader, args,
+               unlabeled_train_eval_loader=None):
     def set_model(train=False, eval=False):
         assert (train ^ eval)
         if train:
@@ -106,6 +135,53 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     save_path = args.model_dir
     if not os.path.exists(save_path):
         os.makedirs(save_path)
+
+    # ----------------------
+    # RUN CONFIG BANNER (debug-friendly, prototail style)
+    # ----------------------
+    try:
+        _n_lab = len(train_loader.dataset.labelled_dataset)
+        _n_unl = len(train_loader.dataset.unlabelled_dataset)
+        _n_test = len(test_loader.dataset)
+        _n_unl_eval = (len(unlabeled_train_eval_loader.dataset)
+                       if unlabeled_train_eval_loader is not None else -1)
+        _unl_freq = getattr(args, 'unl_eval_freq', None)
+        args.logger.info("=" * 65)
+        args.logger.info("        BACON TRAINING RUN — CONFIG SUMMARY")
+        args.logger.info("=" * 65)
+        args.logger.info(f"Dataset:          {args.dataset_name} (imb_ratio={args.imb_ratio} | "
+                         f"labeled={args.num_labeled_classes} novel={args.num_unlabeled_classes})")
+        args.logger.info(f"Backbone:         {getattr(args, 'backbone', 'unknown')} | Views: {args.n_views}")
+        args.logger.info(f"Epochs:           {args.epochs} | test_freq={args.test_freq} | "
+                         f"est_freq={args.est_freq} | print_freq={args.print_freq} | "
+                         f"unl_eval_freq={_unl_freq if _unl_freq is not None else '=test_freq'} | "
+                         f"quick_eval_freq={getattr(args, 'quick_eval_freq', None) or 'OFF'}")
+        args.logger.info(f"Batch Size:       {args.batch_size} | Workers: {args.num_workers} | LR: {args.lr} | "
+                         f"Precision: {'fp16 AMP' if getattr(args, 'fp16', False) else 'fp32'}")
+        args.logger.info(f"Seed:             {getattr(args, 'train_seed', '?')} | Early stop: "
+                         f"{getattr(args, 'early_stop_patience', 0)} rounds | "
+                         f"Time budget: {getattr(args, 'time_budget_hours', 0)}h")
+        args.logger.info(f"Train Loaders:    labeled={_n_lab} | unlabeled={_n_unl} | merged={_n_lab + _n_unl}")
+        args.logger.info(f"Eval Loaders:     disjoint-test={_n_test} | "
+                         f"unlabeled-train-pool={_n_unl_eval if _n_unl_eval >= 0 else 'OFF'}")
+        args.logger.info(f"Pseudo Labeling:  "
+                         f"{'ACTIVE (mode ' + str(args.pseudo_mode) + ', warmup=' + str(args.pseudo_warmup_epoch) + ')' if args.enable_pseudo_labeling else 'DISABLED'}")
+        args.logger.info(f"Novel Pseudo (D2):"
+                         f"{'ACTIVE' if getattr(args, 'enable_novel_pseudo', False) else 'DISABLED'}")
+        if getattr(args, 'use_parts', False):
+            args.logger.info(f"AdaPart:          ACTIVE (M={args.num_slots}, lambda={args.part_lambda} | "
+                             f"fused_ce={'ON' if not args.ablate_fused_ce else 'OFF'}, "
+                             f"spatial={'ON' if not args.ablate_spatial_loss else 'OFF'}, "
+                             f"conf_filter={'ON' if not args.ablate_confidence else 'OFF'}, "
+                             f"adaptive_cap={'ON' if not args.ablate_adaptive_capacity else 'OFF'}, "
+                             f"concat_eval={'ON' if not args.ablate_concat_eval else 'OFF'})")
+        else:
+            args.logger.info("AdaPart:          DISABLED")
+        args.logger.info(f"Logit Adjust:     {'ACTIVE' if getattr(args, 'use_logit_adjust', False) else 'OFF'} | "
+                         f"Teacher: {'ACTIVE (m0=' + str(getattr(args, 'teacher_m0', 0.996)) + ')' if getattr(args, 'use_momentum_teacher', False) else 'OFF'}")
+        args.logger.info("=" * 65)
+    except Exception as e:
+        args.logger.warning(f'[BANNER] skipped: {e}')
 
     student_ce = nn.Sequential(ce_backbone, ce_head).to(device)
     student_cl = nn.Sequential(cl_backbone, cl_head).to(device)
@@ -136,8 +212,19 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         T_max=args.epochs,
         eta_min=args.lr * 1e-3,
     )
+    # AMP fp16 (bat bang --fp16): autocast quanh forward, GradScaler quanh
+    # backward/step. Moi loss van tinh o fp32 (upcast sau forward) nen so hoc
+    # giong he che do khong AMP. Khi --fp16 khong bat: scaler la passthrough.
+    try:  # torch>=2.3: API moi, khong deprecated
+        scaler = torch.amp.GradScaler('cuda', enabled=getattr(args, 'fp16', False))
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=getattr(args, 'fp16', False))
     args.current_epoch = 0
     best_test_acc_all_cl = -1
+    best_test_acc_old_cl = -1
+    best_test_acc_new_cl = -1
+    best_unl_acc_all = -1
+    best_unl_epoch = -1
     best_epoch = -1
     epochs_since_best = 0  # early-stop counter (test rounds without new best)
     start_epoch = 0  # resume may push forward
@@ -272,10 +359,21 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     args.logger.warning(f'[RESUME] skip {_key}: {e}')
             else:
                 _sch.last_epoch = start_epoch - 1
+        # AMP GradScaler state (chi co khi checkpoint da luu voi --fp16)
+        if _ckpt.get('scaler') is not None:
+            try:
+                scaler.load_state_dict(_ckpt['scaler'])
+            except Exception as e:
+                args.logger.warning(f'[RESUME] skip scaler: {e}')
         # Best scores: restored if present, else re-discovered (old best .pt
         # file stays on disk and is never overwritten by a different epoch).
         best_epoch = int(_ckpt.get('best_epoch', -1))
         best_test_acc_all_cl = float(_ckpt.get('best_all', -1))
+        if float(_ckpt.get('best_unl_all', -1)) > best_unl_acc_all:
+            best_unl_acc_all = float(_ckpt.get('best_unl_all'))
+            best_unl_epoch = int(_ckpt.get('best_unl_epoch', -1))
+            args.logger.info(f'[RESUME] unlabeled-train best restored: '
+                             f'all={best_unl_acc_all:.2f} @ ep{best_unl_epoch}')
         # Teacher must mirror the LOADED student, not the init weights.
         if teacher_ce is not None:
             teacher_ce = _build_teacher_ce(student_ce, args, device)
@@ -320,6 +418,11 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         loss_record_ce = AverageMeter()
         loss_record_cl = AverageMeter()
         ema_purity_record = AverageMeter()
+        # Per-component loss meters (debug-friendly epoch summary)
+        comp_meters = {name: AverageMeter() for name in
+                       ('cls', 'cps', 'reg', 'sup_con', 'contrastive',
+                        'fused', 'spatial', 'gate_reg', 'dist_gate')}
+        _ep_t0 = _time.time()
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
         for batch_idx, batch in enumerate(pbar):
             images_, class_labels, uq_idxs, mask_lab = batch
@@ -330,31 +433,45 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             from model.backbone import (forward_blocks_from,
                                              forward_frozen_prefix,
                                              split_cls_patches)
-            # Frozen prefix (blocks < grad_from_block) shared by both branches
-            # (identical init + frozen, saves compute). Works for DINOv1/v2.
-            x = forward_frozen_prefix(ce_backbone, images, args.grad_from_block)
+            # Toan bo forward chay trong autocast fp16 khi --fp16 (phan lon
+            # compute la frozen prefix + teacher, deu khong luu activation graph).
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                # Frozen prefix (blocks < grad_from_block) shared by both branches
+                # (identical init + frozen, saves compute). Works for DINOv1/v2.
+                x = forward_frozen_prefix(ce_backbone, images, args.grad_from_block)
 
-            ce_out = forward_blocks_from(x, ce_backbone, args.grad_from_block)
-            ce_out = ce_backbone.norm(ce_out)
-            ce_backbone_feature, _ = split_cls_patches(ce_out, ce_backbone)
-            student_out = ce_head(ce_backbone_feature)
+                ce_out = forward_blocks_from(x, ce_backbone, args.grad_from_block)
+                ce_out = ce_backbone.norm(ce_out)
+                ce_backbone_feature, _ = split_cls_patches(ce_out, ce_backbone)
+                student_out = ce_head(ce_backbone_feature)
 
-            cl_out = forward_blocks_from(x, cl_backbone, args.grad_from_block)
-            cl_full = cl_backbone.norm(cl_out)
-            cl_backbone_feature, cl_patch_tokens = split_cls_patches(cl_full, cl_backbone)
-            cl_proj_feature = cl_head(cl_backbone_feature)
+                cl_out = forward_blocks_from(x, cl_backbone, args.grad_from_block)
+                cl_full = cl_backbone.norm(cl_out)
+                cl_backbone_feature, cl_patch_tokens = split_cls_patches(cl_full, cl_backbone)
+                cl_proj_feature = cl_head(cl_backbone_feature)
+
+            # Upcast ket qua ve fp32: cac loss ben duoi giuyen dung so hoc fp32
+            # giong he 100% voi che do khong AMP (grad van chay qua graph fp16).
+            student_out = student_out.float()
+            cl_backbone_feature = cl_backbone_feature.float()
+            cl_patch_tokens = cl_patch_tokens.float()
+            cl_proj_feature = cl_proj_feature.float()
 
             ####################### COMPUTE LOSS #######################
             pstr = ''
             if teacher_ce is not None:
                 # A1: dap an tu teacher cham (on dinh), khong phai student.detach()
-                with torch.no_grad():
+                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.float16,
+                                                     enabled=getattr(args, 'fp16', False)):
                     teacher_out = teacher_ce(images)
+                teacher_out = teacher_out.float()
             else:
                 teacher_out = student_out.detach()
 
             # clustering, unsup
             cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
+            comp_meters['cps'].update(cluster_loss.item(), class_labels.size(0))
 
             # clustering, sup
             sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
@@ -368,8 +485,10 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 sup_logits = sup_logits - _la
 
             cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
+            comp_meters['cls'].update(cls_loss.item(), class_labels.size(0))
 
             me_max_loss = compute_reg_loss(student_out, est_count, args)
+            comp_meters['reg'].update(me_max_loss.item(), class_labels.size(0))
 
             pstr += f'cls_loss: {cls_loss.item():.2f} '
             pstr += f'cps_loss: {cluster_loss.item():.2f} '
@@ -387,6 +506,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     loss_spatial, _, _ = compute_spatial_loss(A)
                     loss_ce = loss_ce + 0.05 * loss_spatial
                     pstr += f'spatial: {loss_spatial.item():.2f} '
+                    comp_meters['spatial'].update(loss_spatial.item(), class_labels.size(0))
 
                 # 2. Fused CE loss on labeled subset only (using view 0)
                 if not args.ablate_fused_ce:
@@ -414,6 +534,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                         )
                         loss_ce = loss_ce + loss_fused
                         pstr += f'fused_ce: {loss_fused.item():.2f} '
+                        comp_meters['fused'].update(loss_fused.item(), class_labels.size(0))
                         
                         gate_max = a.max(dim=-1)[0].mean().item()
                         pstr += f'gate_max: {gate_max:.2f} '
@@ -421,6 +542,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                         # Gate regularization
                         loss_gate, _, _ = compute_gate_reg_loss(a)
                         loss_ce = loss_ce + 0.05 * loss_gate
+                        comp_meters['gate_reg'].update(loss_gate.item(), class_labels.size(0))
 
                         # Distribution-adaptive gating
                         if not args.ablate_adaptive_capacity and est_count is not None:
@@ -429,20 +551,21 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                             loss_dist = compute_dist_adaptive_gate_loss(a, M_target)
                             loss_ce = loss_ce + 0.05 * loss_dist
                             pstr += f'dist_gate: {loss_dist.item():.2f} '
+                            comp_meters['dist_gate'].update(loss_dist.item(), class_labels.size(0))
 
                 optimizer_part.zero_grad()
                 optimizer_gate.zero_grad()
                 optimizer_ce.zero_grad()
                 optimizer_cl.zero_grad()
-                loss_ce.backward(retain_graph=True)
+                scaler.scale(loss_ce).backward(retain_graph=True)
                 # loss_ce chứa fused CE -> grad đi vào ce + part queries/gate + cl late blocks.
                 # Giữ grad cl lại, cộng dồn loss_cl bên dưới rồi mới step một lần.
                 loss_record_ce.update(loss_ce.item(), class_labels.size(0))
             else:
                 loss_record_ce.update(loss_ce.item(), class_labels.size(0))
                 optimizer_ce.zero_grad()
-                loss_ce.backward()
-                optimizer_ce.step()
+                scaler.scale(loss_ce).backward()
+                scaler.step(optimizer_ce)
                 if teacher_ce is not None:
                     _ema_update_teacher(teacher_ce, student_ce, args._teacher_m)
 
@@ -481,6 +604,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
             contrastive_logits, contrastive_labels = info_nce_logits(features=cl_proj_feature)
             contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
+            comp_meters['contrastive'].update(contrastive_loss.item(), class_labels.size(0))
 
             # representation learning, sup
             sup_cl_proj_feature = torch.cat([f[mask_lab].unsqueeze(1) for f in cl_proj_feature.chunk(2)], dim=1)
@@ -494,6 +618,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             else:
                 sup_con_loss = SupConLoss()(sup_cl_proj_feature, labels=sup_con_labels)
                 loss_cl += ((1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss)
+            comp_meters['sup_con'].update(sup_con_loss.item(), class_labels.size(0))
 
             pstr += f'sup_con_loss: {sup_con_loss.item():.2f} '
             pstr += f'contrastive_loss: {contrastive_loss.item():.2f} '
@@ -502,17 +627,19 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             if part_module is not None:
                 # Cộng dồn grad contrastive vào grad part đã có, rồi step cả 4 optimizer một lần.
                 # Không zero_grad ở đây vì đã zero trước loss_ce.backward().
-                loss_cl.backward()
-                optimizer_ce.step()
-                optimizer_cl.step()
-                optimizer_part.step()
-                optimizer_gate.step()
+                scaler.scale(loss_cl).backward()
+                scaler.step(optimizer_ce)
+                scaler.step(optimizer_cl)
+                scaler.step(optimizer_part)
+                scaler.step(optimizer_gate)
+                scaler.update()
                 if teacher_ce is not None:
                     _ema_update_teacher(teacher_ce, student_ce, args._teacher_m)
             else:
                 optimizer_cl.zero_grad()
-                loss_cl.backward()
-                optimizer_cl.step()
+                scaler.scale(loss_cl).backward()
+                scaler.step(optimizer_cl)
+                scaler.update()
 
             if batch_idx % args.print_freq == 0:
                 pbar.set_postfix({
@@ -520,14 +647,60 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     'loss_cl': f"{loss_cl.item():.4f}", 
                     'metrics': pstr.strip()
                 })
+            # Detached-run friendly progress line (greppable trong log.txt)
+            if batch_idx % max(1, args.print_freq * 5) == 0:
+                args.logger.info(
+                    f'Epoch {epoch} progress {100.0 * (batch_idx + 1) / max(1, len(pbar)):.0f}% '
+                    f'[{batch_idx + 1}/{len(pbar)}] loss_ce={loss_ce.item():.3f} '
+                    f'loss_cl={loss_cl.item():.3f} '
+                    f'lr_ce={optimizer_ce.param_groups[0]["lr"]:.5f} '
+                    f'lr_cl={optimizer_cl.param_groups[0]["lr"]:.5f}')
 
-        args.logger.info('Train Epoch: {} Avg Loss_ce: {:.2f} Avg Loss_cl: {:.2f}'.format(epoch, loss_record_ce.avg, loss_record_cl.avg))
+        _ep_time = _time.time() - _ep_t0
+        _elapsed_min = (_time.time() - args._train_t0) / 60.0
+        _done_eps = max(1, epoch - start_epoch + 1)
+        _eta_min = _elapsed_min / _done_eps * (args.epochs - epoch - 1)
+        _gpu_peak_gb = 0.0
+        try:
+            _gpu_peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        _comp_str = ' '.join(f'{k}={m.avg:.2f}' for k, m in comp_meters.items() if m.count > 0)
+        args.logger.info(
+            'Train Epoch: {} Avg Loss_ce: {:.2f} Avg Loss_cl: {:.2f} | '
+            'lr_ce {:.5f} lr_cl {:.5f} | epoch_time {:.1f}s | gpu_peak {:.1f}GB | '
+            'ETA {:.0f}min'.format(
+                epoch, loss_record_ce.avg, loss_record_cl.avg,
+                optimizer_ce.param_groups[0]['lr'], optimizer_cl.param_groups[0]['lr'],
+                _ep_time, _gpu_peak_gb, _eta_min))
+        if _comp_str:
+            args.logger.info(f'  Loss Components (epoch avg): {_comp_str}')
         if (epoch % 10 == 0 or epoch == args.epochs - 1) and ema_purity_record.count > 0:
             args.logger.info(f"[EMA-Novel] purity={ema_purity_record.avg:.3f}")
 
         if (epoch+1) % args.est_freq == 0:
             set_model(eval=True)
             est_count = dist_est(ce_backbone, cl_backbone, ce_head, train_all_test_trans_loader, args)
+
+        # ---- Quick KMeans eval (nhe) — moi quick_eval_freq epoch ----
+        # Chi de theo doi tien do: fit subsample <=15k + 1 dong log, khong
+        # checkpoint, khong per-class/chart. Bo qua nhung epoch da co test().
+        _qf = getattr(args, 'quick_eval_freq', None)
+        if _qf and epoch % _qf == 0 and epoch % args.test_freq != 0:
+            set_model(eval=True)
+            _q_loader = (unlabeled_train_eval_loader if unlabeled_train_eval_loader is not None
+                         else test_loader)
+            _q_set = ('unlabeled-train-pool' if unlabeled_train_eval_loader is not None
+                      else 'disjoint-test')
+            _q_t0 = _time.time()
+            with torch.no_grad():
+                q_all, q_old, q_new = quick_kmeans_eval(student_cl, _q_loader, args, epoch)
+            args.logger.info(
+                f'[QUICK-KMEANS] epoch {epoch}: All {q_all:.1f} | Old {q_old:.1f} | '
+                f'New {q_new:.1f} | {_time.time() - _q_t0:.1f}s '
+                f'(moi {_qf} epoch, subsample <=15k, set={_q_set})')
+            set_model(train=True)
 
         if epoch % args.test_freq == 0:
             args.logger.info('Testing on disjoint test set...')
@@ -545,15 +718,84 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     'Test Accuracies CL: All {:.1f} | Old {:.1f} | New {:.1f}'.format(all_acc_test_cl,
                                                                                       old_acc_test_cl,
                                                                                       new_acc_test_cl))
+            _log_eval_compact(args, 'DISJOINT-TEST', epoch, all_acc_test_cl, old_acc_test_cl,
+                              new_acc_test_cl, acc_list_cl, nmi_cl, ari_cl,
+                              breakdown_label='Test')
+
+            # ------------------------------
+            # UNLABELED-TRAIN EVAL (GCD in-distribution protocol)
+            # Cluster KMeans tren unlabeled pool cua train split (unl_k + unl_unk,
+            # test transform, co GT) — dung de doc ket qua theo protocol GCD
+            # chuan (Vaze/SimGCD/BaCon). GT chi dung de tinh metric.
+            # ------------------------------
+            all_acc_unl, old_acc_unl, new_acc_unl, acc_list_unl, nmi_unl, ari_unl = (None,) * 6
+            _unl_freq = getattr(args, 'unl_eval_freq', None)
+            _do_unl = (unlabeled_train_eval_loader is not None) and \
+                      ((_unl_freq is None) or (epoch % _unl_freq == 0))
+            if _do_unl:
+                args.logger.info('Testing on unlabeled train pool (GCD in-distribution protocol)...')
+                with torch.no_grad():
+                    (all_acc_unl, old_acc_unl, new_acc_unl,
+                     acc_list_unl, _ind_map_unl, nmi_unl, ari_unl) = test(
+                        student_cl,
+                        unlabeled_train_eval_loader,
+                        epoch=epoch,
+                        save_name='Unlabeled-Train ACC',
+                        args=args,
+                        train_loader=train_loader)
+                args.logger.info(
+                    'Unlabeled-Train Accuracies CL: All {:.1f} | Old {:.1f} | New {:.1f}'.format(
+                        all_acc_unl, old_acc_unl, new_acc_unl))
+                _log_eval_compact(args, 'UNLABELED-TRAIN', epoch, all_acc_unl, old_acc_unl,
+                                  new_acc_unl, acc_list_unl, nmi_unl, ari_unl,
+                                  breakdown_label='Train')
+
+                if all_acc_unl > best_unl_acc_all:
+                    best_unl_acc_all = all_acc_unl
+                    best_unl_epoch = epoch
+                    save_dict_unl = {
+                        'epoch': epoch,
+                        'best_epoch': int(best_epoch),
+                        'best_all': float(best_test_acc_all_cl),
+                        'best_old': float(best_test_acc_old_cl),
+                        'best_new': float(best_test_acc_new_cl),
+                        'best_unl_all': float(all_acc_unl),
+                        'best_unl_epoch': int(epoch),
+                        'opt_ce': optimizer_ce.state_dict(),
+                        'opt_cl': optimizer_cl.state_dict(),
+                        'sch_ce': exp_lr_scheduler_ce.state_dict(),
+                        'sch_cl': exp_lr_scheduler_cl.state_dict(),
+                        'sch_part': (scheduler_part.state_dict()
+                                     if scheduler_part is not None else None),
+                        'sch_gate': (scheduler_gate.state_dict()
+                                     if scheduler_gate is not None else None),
+                        'ce_backbone': ce_backbone.state_dict(),
+                        'ce_head': ce_head.state_dict(),
+                        'cl_backbone': cl_backbone.state_dict(),
+                        'cl_head': cl_head.state_dict(),
+                        'part_module': (part_module.state_dict()
+                                        if part_module is not None else None),
+                        'part_bank': (part_bank.state_dict()
+                                      if part_bank is not None else None),
+                        'args_backbone': getattr(args, 'backbone', 'unknown'),
+                    }
+                    torch.save(save_dict_unl, save_path + '/model_best_unlabeled.pt')
+                    args.logger.info(f'  [*] New best Unlabeled-Train All Acc: '
+                                     f'{best_unl_acc_all:.2f} (epoch {best_unl_epoch}) '
+                                     f'-> model_best_unlabeled.pt')
+
             # Per-epoch test history (viec 5: novel-tax line ve post-hoc tu JSON,
             # khong parse log). Lazy-init de run cu khong anh huong.
             if getattr(args, '_test_history', None) is None:
                 args._test_history = []
             try:
+                _h_test = (2.0 * old_acc_test_cl * new_acc_test_cl / (old_acc_test_cl + new_acc_test_cl)) \
+                    if (old_acc_test_cl + new_acc_test_cl) > 0 else 0.0
                 args._test_history.append({
                     'epoch': int(epoch),
                     'all': float(all_acc_test_cl), 'old': float(old_acc_test_cl),
                     'new': float(new_acc_test_cl),
+                    'h_score': float(_h_test),
                     'k_many': float(acc_list_cl[0]), 'k_med': float(acc_list_cl[1]),
                     'k_few': float(acc_list_cl[2]),
                     'u_many': float(acc_list_cl[3]), 'u_med': float(acc_list_cl[4]),
@@ -561,6 +803,15 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     'nmi': float(nmi_cl) if nmi_cl is not None else None,
                     'ari': float(ari_cl) if ari_cl is not None else None,
                     'pseudo_total': int(pseudo_samples_added) if args.enable_pseudo_labeling else 0,
+                    'unl_all': (float(all_acc_unl) if all_acc_unl is not None else None),
+                    'unl_old': (float(old_acc_unl) if old_acc_unl is not None else None),
+                    'unl_new': (float(new_acc_unl) if new_acc_unl is not None else None),
+                    'unl_k_many': (float(acc_list_unl[0]) if acc_list_unl is not None else None),
+                    'unl_k_med': (float(acc_list_unl[1]) if acc_list_unl is not None else None),
+                    'unl_k_few': (float(acc_list_unl[2]) if acc_list_unl is not None else None),
+                    'unl_u_many': (float(acc_list_unl[3]) if acc_list_unl is not None else None),
+                    'unl_u_med': (float(acc_list_unl[4]) if acc_list_unl is not None else None),
+                    'unl_u_few': (float(acc_list_unl[5]) if acc_list_unl is not None else None),
                 })
             except Exception:
                 pass
@@ -777,6 +1028,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                              if scheduler_part is not None else None),
                 'sch_gate': (scheduler_gate.state_dict()
                              if scheduler_gate is not None else None),
+                # AMP scaler state (None khi khong dung --fp16)
+                'scaler': (scaler.state_dict()
+                           if getattr(args, 'fp16', False) else None),
                 'ce_backbone': ce_backbone.state_dict(),
                 'ce_head': ce_head.state_dict(),
                 'cl_backbone': cl_backbone.state_dict(),
@@ -813,6 +1067,32 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
     args.logger.info(
         f'Metrics with best model on test set: All: {best_test_acc_all_cl:.1f} Old: {best_test_acc_old_cl:.1f} New: {best_test_acc_new_cl:.1f} ')
+
+    # ----------------------
+    # FINAL SUMMARY (prototail-style, 3 giao thức)
+    # ----------------------
+    try:
+        _h_best_test = (2.0 * best_test_acc_old_cl * best_test_acc_new_cl /
+                        (best_test_acc_old_cl + best_test_acc_new_cl)) \
+            if (best_test_acc_old_cl + best_test_acc_new_cl) > 0 else 0.0
+        args.logger.info("=" * 65)
+        args.logger.info("                    FINAL SUMMARY")
+        args.logger.info("=" * 65)
+        args.logger.info(f'[BEST DISJOINT-TEST MODEL]   (Epoch {best_epoch}): '
+                         f'All {best_test_acc_all_cl:.2f} | Known {best_test_acc_old_cl:.2f} | '
+                         f'Novel {best_test_acc_new_cl:.2f} | H-Score {_h_best_test:.2f} | '
+                         f'ckpt: model_epoch{best_epoch}.pt')
+        if best_unl_epoch >= 0:
+            args.logger.info(f'[BEST UNLABELED-TRAIN MODEL] (Epoch {best_unl_epoch}): '
+                             f'All {best_unl_acc_all:.2f} | ckpt: model_best_unlabeled.pt')
+        else:
+            args.logger.info('[BEST UNLABELED-TRAIN MODEL] none recorded '
+                             '(unlabeled eval never ran — check unlabeled_train_eval_loader)')
+        args.logger.info(f'[PAPER PROTOCOL NOTE] GCD ACC chuan = report tren unlabeled-train pool; '
+                         f'disjoint-test la thuc do generalization.')
+        args.logger.info("=" * 65)
+    except Exception as e:
+        args.logger.warning(f'[FINAL SUMMARY] failed: {e}')
 
     # ----------------------
     # FINAL EVALUATION with best checkpoint → final_report.txt / .csv
@@ -858,6 +1138,32 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 'u_std': np.array(acc_list[3:6]).std(),
                 'nmi': nmi, 'ari': ari,
             }
+
+            # Final unlabeled-train eval tren cung best checkpoint (GCD protocol)
+            final_unl = {}
+            if unlabeled_train_eval_loader is not None:
+                try:
+                    (all_acc_unl_f, old_acc_unl_f, new_acc_unl_f,
+                     acc_list_unl_f, _m_unl, nmi_unl_f, ari_unl_f) = test(
+                        student_cl, unlabeled_train_eval_loader, epoch=best_epoch,
+                        save_name='Final Unlabeled-Train ACC', args=args,
+                        train_loader=train_loader)
+                    _h_unl_f = (2.0 * old_acc_unl_f * new_acc_unl_f /
+                                (old_acc_unl_f + new_acc_unl_f)) \
+                        if (old_acc_unl_f + new_acc_unl_f) > 0 else 0.0
+                    args.logger.info(
+                        f'[UNLABELED-TRAIN EVAL - FINAL] (best disjoint ckpt, ep {best_epoch}): '
+                        f'All {all_acc_unl_f:.2f} | Known {old_acc_unl_f:.2f} | '
+                        f'Novel {new_acc_unl_f:.2f} | H-Score {_h_unl_f:.2f}')
+                    final_unl = {
+                        'unlabeled_all': float(all_acc_unl_f),
+                        'unlabeled_old': float(old_acc_unl_f),
+                        'unlabeled_new': float(new_acc_unl_f),
+                        'unlabeled_h_score': float(_h_unl_f),
+                    }
+                except Exception as e:
+                    args.logger.warning(f'[FINAL EVAL] unlabeled eval failed: {e}')
+
             from util.visualize_utils import save_final_report
             save_final_report(accs, args, extra_info={
                 'dataset': args.dataset_name,
@@ -870,6 +1176,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 'pseudo_mode': getattr(args, 'pseudo_mode', 0),
                 'logit_adjust': getattr(args, 'use_logit_adjust', False),
                 'momentum_teacher': getattr(args, 'use_momentum_teacher', False),
+                'best_unl_epoch': best_unl_epoch,
+                'best_unl_all': (float(best_unl_acc_all) if best_unl_epoch >= 0 else None),
+                **final_unl,
             })
         else:
             args.logger.warning('[FINAL EVAL] No best checkpoint found — skipping final report.')
@@ -898,6 +1207,50 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         args.logger.warning(f'[HISTORY] Failed to write history JSONs: {e}')
 
 
+def quick_kmeans_eval(model, loader, args, epoch, subsample_max=15000, n_init=10):
+    """Eval KMeans NHE de theo doi tien do giua cac lan test() chinh.
+
+    Giong protocol GCD cua test(): CL backbone feats (test transform) ->
+    KMeans voi K = num_classes. Khac biet: fit tren subsample <=subsample_max
+    roi assign full set (cung chien luoc voi khoi novel-pseudo), khong co
+    per-class breakdown, PCA/t-SNE hay checkpoint — chi tra ve (all, old, new).
+    """
+    model.eval()
+    n_lab = len(args.train_classes)
+    all_feats, all_targets = [], []
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch[:3]
+            images, label, _ = batch
+            images = images.cuda(non_blocking=True)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                feats = model[0](images)
+            feats = torch.nn.functional.normalize(feats.float(), dim=-1)
+            all_feats.append(feats.detach().cpu().numpy())
+            all_targets.append(label.cpu().numpy())
+
+    all_feats = np.concatenate(all_feats)
+    targets = np.concatenate(all_targets).astype(int)
+    mask = (targets < n_lab)  # old classes = labeled (0..n_lab-1)
+
+    K = args.num_labeled_classes + args.num_unlabeled_classes
+    rng = np.random.RandomState(epoch)
+    if len(all_feats) > subsample_max:
+        fit_idx = rng.choice(len(all_feats), size=subsample_max, replace=False)
+    else:
+        fit_idx = np.arange(len(all_feats))
+    kmeans = KMeans(n_clusters=K, random_state=0, n_init=n_init).fit(all_feats[fit_idx])
+    preds = kmeans.predict(all_feats)
+
+    (all_acc, old_acc, new_acc, _acc_list, _ind_map,
+     _nmi, _ari) = log_accs_from_preds(
+        y_true=targets, y_pred=preds, mask=mask,
+        eval_funcs=args.eval_funcs, save_name='Quick-KMeans ACC', T=epoch,
+        print_output=False, args=args, train_loader=None)
+    return all_acc, old_acc, new_acc
+
+
 def test(model, test_loader, epoch, save_name, args, train_loader):
     model.eval()
 
@@ -912,7 +1265,9 @@ def test(model, test_loader, epoch, save_name, args, train_loader):
         images = images.cuda()
 
         # Pass features through base model and then additional learnable transform (linear layer)
-        feats = model[0](images)  # follow GCD: clustering on normalized backbone feature
+        with torch.autocast(device_type='cuda', dtype=torch.float16,
+                            enabled=getattr(args, 'fp16', False)):
+            feats = model[0](images)  # follow GCD: clustering on normalized backbone feature
 
         # AdaPart Concat Eval: [z_cls || r_pool] khi bật.
         # r_pool = gate-weighted (không mean đều): slot nào gate của class dự đoán
@@ -920,7 +1275,8 @@ def test(model, test_loader, epoch, save_name, args, train_loader):
         if (getattr(args, 'use_parts', False)
                 and not getattr(args, 'ablate_concat_eval', False)
                 and getattr(args, '_part_module_ref', None) is not None):
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.float16,
+                                                 enabled=getattr(args, 'fp16', False)):
                 from model.backbone import forward_backbone_tokens
                 backbone = model[0]
                 _, patch_tokens, x = forward_backbone_tokens(backbone, images)
@@ -936,6 +1292,7 @@ def test(model, test_loader, epoch, save_name, args, train_loader):
                     r_pool = r_norm.mean(dim=1)  # fallback khi thiếu bank ref
                 feats = torch.cat([x[:, 0], r_pool], dim=-1)
 
+        feats = feats.float()
         feats = torch.nn.functional.normalize(feats, dim=-1)
 
         all_feats.append(feats.detach().cpu().numpy())
@@ -993,8 +1350,10 @@ def evaluate_per_class_accuracy(model, test_loader, known_classes, num_classes, 
             images, labels = batch[0], batch[1]
             images = images.to(device)
 
-            feats = model[0](images)
-            feats = F.normalize(feats, dim=-1)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                feats = model[0](images)
+            feats = F.normalize(feats.float(), dim=-1)
             all_feats.append(feats.cpu().numpy())
             all_labels.append(labels.numpy())
 
@@ -1094,8 +1453,10 @@ def evaluate_train_labeled_per_class_accuracy(model, labelled_loader, num_labele
                 labels = torch.tensor(labels)
             labels = labels.to(device)
 
-            feats = model[0](images)
-            feats = F.normalize(feats, dim=-1)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                feats = model[0](images)
+            feats = F.normalize(feats.float(), dim=-1)
             logits = model[1](feats)
             preds = logits.argmax(dim=1)
             for p, t in zip(preds, labels):
@@ -1165,8 +1526,10 @@ def compute_unsupervised_class_scores(model, unlab_loader, num_labeled, device='
                 images = images[0]
             images = images.to(device)
 
-            feats = model[0](images)
-            feats = F.normalize(feats, dim=-1)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                feats = model[0](images)
+            feats = F.normalize(feats.float(), dim=-1)
             logits = model[1](feats)
             probs = F.softmax(logits, dim=1)
             confs, preds = probs.max(dim=1)
@@ -1230,8 +1593,10 @@ def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_c
                 images = images[0]
             images = images.to(device)
 
-            feats = model[0](images)
-            feats = F.normalize(feats, dim=-1)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                feats = model[0](images)
+            feats = F.normalize(feats.float(), dim=-1)
             logits = model[1](feats)
             probs = F.softmax(logits, dim=1)
             confs, preds = probs.max(dim=1)
@@ -1347,8 +1712,12 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
             for batch in unlab_loader:
                 images = _first_view(batch[0]).to(device)
                 uq = batch[2]
-                cf = F.normalize(cl_backbone(images), dim=-1)
-                ce_f = F.normalize(student_ce[0](images), dim=-1)
+                with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                    enabled=getattr(args, 'fp16', False)):
+                    cf_raw = cl_backbone(images)
+                    ce_f_raw = student_ce[0](images)
+                cf = F.normalize(cf_raw.float(), dim=-1)
+                ce_f = F.normalize(ce_f_raw.float(), dim=-1)
                 logits = student_ce[1](ce_f)
                 probs = F.softmax(logits, dim=1)
                 conf, pred = probs.max(dim=1)
@@ -1385,7 +1754,10 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
                 labels = batch[1]
                 if not torch.is_tensor(labels):
                     labels = torch.tensor(labels)
-                f = F.normalize(cl_backbone(images), dim=-1)
+                with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                    enabled=getattr(args, 'fp16', False)):
+                    f_raw = cl_backbone(images)
+                f = F.normalize(f_raw.float(), dim=-1)
                 L_feats.append(f.cpu())
                 L_true.extend([int(x) for x in labels])
         L_feats = torch.cat(L_feats).numpy()
@@ -2043,6 +2415,15 @@ if __name__ == "__main__":
     parser.add_argument('--local-rank', default=-1, type=int)
     parser.add_argument('--p', default=1.1, type=float)
     parser.add_argument('--test-freq', default=1, type=int)
+    parser.add_argument('--unl-eval-freq', default=None, type=int,
+                        help="Tan suat eval tren unlabeled-train pool (GCD protocol). "
+                             "None = cung nhac voi --test-freq.")
+    parser.add_argument('--quick-eval-freq', '--quick_eval_freq', dest='quick_eval_freq',
+                        default=None, type=int,
+                        help="Eval KMeans nhe moi N epoch (CL feats tren unlabeled pool, fit "
+                             "subsample <=15k, 1 dong log [QUICK-KMEANS]). Khong anh huong "
+                             "test() chinh, checkpoint hay per-class chart; bo qua nhung epoch "
+                             "da co test(). Vi du: --quick-eval-freq 5")
     parser.add_argument('--ce-warmup', default=1, type=int)
     parser.add_argument('--est-freq', default=10, type=int)
     parser.add_argument('--labeled-classes', default=80, type=int)
@@ -2136,6 +2517,8 @@ if __name__ == "__main__":
         total_class = 196
     elif args.dataset_name == 'fgvc_aircraft':
         total_class = 100
+    elif args.dataset_name in ('herbarium19', 'herbarium_19', 'herb19', 'her19', 'herbarium'):
+        total_class = 683
     else:
         total_class = 100
 
@@ -2234,7 +2617,8 @@ if __name__ == "__main__":
     # DATALOADERS
     # --------------------
     train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False,
-                              sampler=sampler, drop_last=True, pin_memory=True)
+                              sampler=sampler, drop_last=True, pin_memory=True,
+                              persistent_workers=args.num_workers > 0)
     test_loader_unlabelled = DataLoader(unlabelled_train_examples_test, num_workers=args.num_workers,
                                         batch_size=256, shuffle=False, pin_memory=False)
     test_loader_labelled = DataLoader(test_dataset, num_workers=args.num_workers,
@@ -2269,7 +2653,8 @@ if __name__ == "__main__":
     cl_backbone = cl_backbone.to(device)
     cl_head = cl_head.to(device)
     
-    train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_loader_labelled, args)
+    train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_loader_labelled, args,
+               unlabeled_train_eval_loader=train_unlabelled_test_trans_loader)
 
 
 

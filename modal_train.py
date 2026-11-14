@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
 from datetime import datetime
@@ -79,6 +80,12 @@ def _run(cmd: list[str], cwd: Path = PROJECT_DIR) -> None:
     env["CUB_ROOT"] = f"{DATA_DIR}/cub/CUB_200_2011"
     env["CARS_ROOT"] = f"{DATA_DIR}/cars"
     env["AIRCRAFT_ROOT"] = f"{DATA_DIR}/aircraft"
+    # Modal volume stores herbarium under 'herbarium' or 'herbarium19'
+    herb_candidate = Path(f"{DATA_DIR}/herbarium")
+    if herb_candidate.is_dir():
+        env["HERBARIUM_ROOT"] = str(herb_candidate)
+    else:
+        env["HERBARIUM_ROOT"] = f"{DATA_DIR}/herbarium19"
     print("$", " ".join(cmd), flush=True)
     # Commit volume dinh ky: preemption (A10G) giua chung van giu duoc
     # checkpoint tren volume de lan restart sau auto-resume.
@@ -210,7 +217,7 @@ def train(
     dataset_name: str = "cifar100",
     imb_ratio: int = 100,
     epochs: int = 100,
-    batch_size: int = 1024,
+    batch_size: int = 128,
     lr: float | None = None,
     gpu_count_workers: int = 8,
     extra_args: list[str] | None = None,
@@ -340,22 +347,27 @@ def train(
     # Create symlink for tensorboard
     _ensure_link(project_dir / "tensorboard", exp_dirs['tensorboard'])
 
-    # Determine labeled classes
-    if dataset_name == "cifar10":
+    # Determine labeled classes and normalize dataset name
+    if dataset_name in ("stanford_cars", "cars"):
+        dataset_name = "stanford_cars"
+        labeled_classes = 98
+        Path(f"{DATA_DIR}/cars").mkdir(parents=True, exist_ok=True)
+    elif dataset_name == "cifar10":
         labeled_classes = 5
     elif dataset_name == "cub200":
         labeled_classes = 100
         # Ensure CUB directory exists
         cub_dir = Path(f"{DATA_DIR}/cub")
         cub_dir.mkdir(parents=True, exist_ok=True)
-    elif dataset_name == "stanford_cars":
-        labeled_classes = 98
-        Path(f"{DATA_DIR}/cars").mkdir(parents=True, exist_ok=True)
     elif dataset_name == "fgvc_aircraft":
         labeled_classes = 80
         Path(f"{DATA_DIR}/aircraft").mkdir(parents=True, exist_ok=True)
     elif dataset_name == "imagenet100":
         labeled_classes = 50
+    elif dataset_name in ("herbarium19", "herbarium_19", "her19", "herb19", "herbarium"):
+        dataset_name = "herbarium19"
+        labeled_classes = 341
+        Path(f"{DATA_DIR}/herbarium19").mkdir(parents=True, exist_ok=True)
     else:
         labeled_classes = 80
 
@@ -609,13 +621,34 @@ def _download_results(experiment_name: str) -> None:
     if got:
         print(f"\nResults saved to: {local_dir}\n")
 
+    # Auto-export log to user designated folder (default D:\data\log bacon)
+    target_log_dir = Path(os.environ.get("BACON_LOG_DIR", r"D:\data\log bacon"))
+    short_name = _short_exp_name(experiment_name)
+    local_log = local_dir / "log.txt"
+    if local_log.exists():
+        try:
+            target_log_dir.mkdir(parents=True, exist_ok=True)
+            target_log_file = target_log_dir / f"{short_name}.txt"
+            shutil.copyfile(local_log, target_log_file)
+            print(f"[results] Log automatically exported to: {target_log_file}")
+
+            local_report = local_dir / "final_report.csv"
+            if local_report.exists():
+                target_report_file = target_log_dir / f"{short_name}_final_report.csv"
+                shutil.copyfile(local_report, target_report_file)
+                print(f"[results] Final report exported to: {target_report_file}")
+        except Exception as e:
+            print(f"[results] Could not copy log to {target_log_dir}: {e}")
+
 
 @app.local_entrypoint()
 def main(
+    baseline: str = "bacon",
+    config: str = "",
     dataset_name: str = "cifar100",
     imb_ratio: int = 100,
     epochs: int = 100,
-    batch_size: int = 1024,
+    batch_size: int = 128,
     lr: float | None = None,
     num_workers: int = 8,
     extra_args: str = "",
@@ -667,6 +700,39 @@ def main(
     download_results: bool = True,
 ) -> None:
     """Local entry point for training."""
+    if config:
+        cfg_clean = config.strip()
+        if not exp_name_suffix:
+            exp_name_suffix = cfg_clean
+        if cfg_clean == "Base":
+            use_parts = False
+            enable_pseudo_labeling = False
+            enable_novel_pseudo = False
+        elif cfg_clean == "Pseudo":
+            use_parts = False
+            enable_pseudo_labeling = True
+            enable_novel_pseudo = True
+        elif cfg_clean == "Prototype":
+            use_parts = True
+            ablate_adaptive_capacity = True
+            enable_pseudo_labeling = False
+            enable_novel_pseudo = False
+        elif cfg_clean == "Prototype_Tailaware":
+            use_parts = True
+            ablate_adaptive_capacity = False
+            enable_pseudo_labeling = False
+            enable_novel_pseudo = False
+        elif cfg_clean == "Full_wo_Tail":
+            use_parts = True
+            ablate_adaptive_capacity = True
+            enable_pseudo_labeling = True
+            enable_novel_pseudo = True
+        elif cfg_clean == "Full":
+            use_parts = True
+            ablate_adaptive_capacity = False
+            enable_pseudo_labeling = True
+            enable_novel_pseudo = True
+
     parsed_extra_args = extra_args.split() if extra_args else []
 
     result = train.remote(
@@ -743,10 +809,12 @@ def main(
 
 @app.local_entrypoint()
 def launch(
+    baseline: str = "bacon",
+    config: str = "",
     dataset_name: str = "cifar100",
     imb_ratio: int = 100,
     epochs: int = 100,
-    batch_size: int = 1024,
+    batch_size: int = 128,
     lr: float | None = None,
     num_workers: int = 8,
     extra_args: str = "",
@@ -807,6 +875,39 @@ def launch(
         modal app ls (to see the running app ID)
         modal logs <app_id>
     """
+    if config:
+        cfg_clean = config.strip()
+        if not exp_name_suffix:
+            exp_name_suffix = cfg_clean
+        if cfg_clean == "Base":
+            use_parts = False
+            enable_pseudo_labeling = False
+            enable_novel_pseudo = False
+        elif cfg_clean == "Pseudo":
+            use_parts = False
+            enable_pseudo_labeling = True
+            enable_novel_pseudo = True
+        elif cfg_clean == "Prototype":
+            use_parts = True
+            ablate_adaptive_capacity = True
+            enable_pseudo_labeling = False
+            enable_novel_pseudo = False
+        elif cfg_clean == "Prototype_Tailaware":
+            use_parts = True
+            ablate_adaptive_capacity = False
+            enable_pseudo_labeling = False
+            enable_novel_pseudo = False
+        elif cfg_clean == "Full_wo_Tail":
+            use_parts = True
+            ablate_adaptive_capacity = True
+            enable_pseudo_labeling = True
+            enable_novel_pseudo = True
+        elif cfg_clean == "Full":
+            use_parts = True
+            ablate_adaptive_capacity = False
+            enable_pseudo_labeling = True
+            enable_novel_pseudo = True
+
     parsed_extra_args = extra_args.split() if extra_args else []
 
     call = train.spawn(
@@ -883,11 +984,28 @@ def fetch(exp_name: str = "") -> None:
 
         modal volume ls bacon-storage outputs/experiments | tail -5
         modal run modal_train.py::fetch --exp-name <full_name>
+        or simply:
+        modal run modal_train.py::fetch  (auto-fetches latest completed experiment)
     """
     if not exp_name:
-        print("Usage: modal run modal_train.py::fetch --exp-name <full_exp_dir_name>")
-        print("Find names with: modal volume ls bacon-storage outputs/experiments")
-        return
+        import asyncio
+        async def _find_latest():
+            dirs = []
+            async for e in storage_volume.listdir(EXPERIMENTS_DIR):
+                dirs.append(PurePosixPath(str(e.path)).name)
+            return sorted(dirs)
+        try:
+            exps = asyncio.run(_find_latest())
+            if not exps:
+                print(f"[fetch] No experiments found under {EXPERIMENTS_DIR} on volume.")
+                return
+            exp_name = exps[-1]
+            print(f"[fetch] No --exp-name provided. Auto-selected latest experiment: {exp_name}")
+        except Exception as e:
+            print("Usage: modal run modal_train.py::fetch --exp-name <full_exp_dir_name>")
+            print("Find names with: modal volume ls bacon-storage outputs/experiments")
+            print(f"Error listing volume: {e}")
+            return
     _download_results(exp_name)
     _download_visualizations(exp_name)
 

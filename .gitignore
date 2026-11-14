@@ -430,3 +430,5 @@ imagenet100/
 !**/README.md
 dev_outputs
 paper
+build_kaggle_kernel/
+dinov2_offline/
