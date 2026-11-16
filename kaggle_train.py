@@ -123,7 +123,14 @@ def _prepare_gcd_dataset(
         "inat2018": ["iNaturalist 2018", "inat2018", "inat", "inaturalist"],
         "inat": ["iNaturalist 2018", "inat2018", "inat", "inaturalist"],
         "inaturalist": ["iNaturalist 2018", "inat2018", "inat", "inaturalist"],
+        "cifar100": ["cifar100", "cifar-100-python", "cifar-100", "cifar100-gcd"],
+        "cifar10": ["cifar10", "cifar-10-batches-py", "cifar-10"],
+        "imagenet100": ["imagenet100", "imagenet100-cmc", "imagenet100_cmc", "imagenet-100", "ImageNet"],
+        "imagenet": ["imagenet100", "imagenet100-cmc", "imagenet100_cmc", "imagenet-100", "ImageNet"],
     }.get(norm, [norm])
+
+    if norm in ("imagenet100", "imagenet-100", "imagenet") and dataset_slug == "nguyntrnminhtm/gcd-data":
+        dataset_slug = "minhtmnguyntrn/imagenet100-cmc"
 
     def _resolve_from_dirs(dirs: list[Path]) -> Path | None:
         for sdir in dirs:
@@ -187,6 +194,46 @@ def _prepare_gcd_dataset(
                 if found_dir:
                     break
 
+    # 4b. Auto-unify ImageNet-100 parts (e.g. train_part01..05, val_part01..05)
+    if norm in ("imagenet100", "imagenet-100", "imagenet"):
+        unified_dir = (
+            Path("/kaggle/working/data/imagenet100")
+            if Path("/kaggle/working").is_dir()
+            else extract_base / "imagenet100"
+        )
+        unified_train = unified_dir / "train"
+        unified_val = unified_dir / "val"
+        parts_found = 0
+        for sdir in search_dirs:
+            if not sdir.is_dir():
+                continue
+            candidates_to_check = [sdir]
+            try:
+                candidates_to_check.extend([c for c in sdir.iterdir() if c.is_dir()])
+            except Exception:
+                pass
+            for cand in candidates_to_check:
+                for sub, target_sub in (("train", unified_train), ("val", unified_val)):
+                    sub_path = cand / sub
+                    if sub_path.is_dir():
+                        for syn_dir in sub_path.iterdir():
+                            if syn_dir.is_dir():
+                                target_sub.mkdir(parents=True, exist_ok=True)
+                                dst = target_sub / syn_dir.name
+                                if not dst.exists():
+                                    try:
+                                        os.symlink(syn_dir, dst, target_is_directory=True)
+                                        parts_found += 1
+                                    except Exception:
+                                        try:
+                                            shutil.copytree(syn_dir, dst)
+                                            parts_found += 1
+                                        except Exception:
+                                            pass
+        if parts_found > 0 or (unified_train.is_dir() and any(unified_train.iterdir())):
+            print(f"[Dataset] Unified ImageNet-100 ready at: {unified_dir}")
+            found_dir = unified_dir
+
     # 5. Resolve data_root
     if found_dir is not None:
         data_root = str(found_dir)
@@ -206,22 +253,36 @@ def _prepare_gcd_dataset(
         pattern = f"herbarium19_k341_imb{imb_ratio}"
     elif norm in ("inat", "inat2018", "inaturalist", "inaturalist2018"):
         pattern = "inat2018_k4071_natural" if str(imb_ratio).lower() == "natural" else f"inat2018_k4071_imb{imb_ratio}"
+    elif norm in ("cifar100", "cifar-100"):
+        pattern = f"cifar100_k80_imb{imb_ratio}"
+    elif norm in ("cifar10", "cifar-10"):
+        pattern = f"cifar10_k5_imb{imb_ratio}"
+    elif norm in ("imagenet100", "imagenet-100", "imagenet"):
+        pattern = "imagenet100"
     else:
         pattern = f"*_imb{imb_ratio}"
 
-    splits_root = str(repo_root / "data_uq_idxs")
-    if (repo_root / "data_uq_idxs" / pattern).is_dir():
-        splits_root = str(repo_root / "data_uq_idxs")
+    if norm in ("imagenet100", "imagenet-100", "imagenet"):
+        if (repo_root / "splits/imagenet100").is_dir():
+            splits_root = str(repo_root / "splits/imagenet100")
+        elif (repo_root / "splits").is_dir():
+            splits_root = str(repo_root / "splits")
+        else:
+            splits_root = str(repo_root / "data_uq_idxs")
     else:
-        for sdir in search_dirs:
-            if not sdir.is_dir():
-                continue
-            for match in sdir.rglob(pattern):
-                if match.is_dir():
-                    splits_root = str(match.parent)
+        splits_root = str(repo_root / "data_uq_idxs")
+        if (repo_root / "data_uq_idxs" / pattern).is_dir():
+            splits_root = str(repo_root / "data_uq_idxs")
+        else:
+            for sdir in search_dirs:
+                if not sdir.is_dir():
+                    continue
+                for match in sdir.rglob(pattern):
+                    if match.is_dir():
+                        splits_root = str(match.parent)
+                        break
+                if splits_root != str(repo_root / "data_uq_idxs"):
                     break
-            if splits_root != str(repo_root / "data_uq_idxs"):
-                break
 
     return data_root, splits_root
 

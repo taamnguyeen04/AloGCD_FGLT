@@ -176,13 +176,15 @@ class PartPrototypeBank(nn.Module):
         self.prototypes.copy_(P)
 
     @torch.no_grad()
-    def update_ema_novel(self, r_norm, pseudo_labels, w, threshold=0.7, momentum=0.99):
+    def update_ema_novel(self, r_norm, pseudo_labels, w, threshold=0.7, momentum=0.99, delta_c=None):
         """
         Update novel class prototypes using EMA with confidence filtering.
         r_norm: (B, M, d)
         pseudo_labels: (B,)
         w: (B,) probability confidence [0,1]
         """
+        if delta_c is not None:
+            threshold = delta_c
         P = self.prototypes
         for c in torch.unique(pseudo_labels):
             mask = (pseudo_labels == c) & (w > threshold)

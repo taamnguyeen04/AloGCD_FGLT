@@ -130,6 +130,23 @@ def _build_code_bundle_b64(repo_root: Path, target_dataset: str = "", target_imb
                         arcname = "data_uq_idxs/" + p.relative_to(s_dir).as_posix()
                         z.write(p, arcname)
 
+        # 4b. splits/ (pack splits/imagenet100 when targeting imagenet)
+        dname_lower = (target_dataset or "").lower()
+        if "imagenet" in dname_lower:
+            splits_dir = None
+            for cand_sp in [p_root / "splits", repo_root / "splits", Path(r"C:\Users\tam\Documents\GitHub\BaCon\splits")]:
+                if cand_sp.is_dir():
+                    splits_dir = cand_sp
+                    break
+            if splits_dir is not None:
+                for root, dirs, files in os.walk(splits_dir):
+                    if "__pycache__" in root:
+                        continue
+                    for f in files:
+                        p = Path(root) / f
+                        arcname = "splits/" + p.relative_to(splits_dir).as_posix()
+                        z.write(p, arcname)
+
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -156,7 +173,7 @@ def _safe_clean_staging_dir(staging_dir: Path) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Push ProtoTail training job to Kaggle GPU")
     parser.add_argument("--baseline", choices=["simgcd", "bacon"], default="simgcd")
-    parser.add_argument("--dataset-name", "--dataset_name", dest="dataset_name", choices=["cub", "cub200", "cars", "car", "scars", "aircraft", "air", "fgvc_aircraft", "herbarium", "herbarium19", "herb19", "inat", "inat2018", "inaturalist", "inaturalist2018"], default="cub")
+    parser.add_argument("--dataset-name", "--dataset_name", dest="dataset_name", choices=["cub", "cub200", "cars", "car", "scars", "aircraft", "air", "fgvc_aircraft", "herbarium", "herbarium19", "herb19", "inat", "inat2018", "inaturalist", "inaturalist2018", "cifar100", "cifar-100", "cifar10", "cifar-10", "imagenet100", "imagenet-100", "imagenet"], default="cub")
     parser.add_argument("--imb-ratio", "--imb_ratio", dest="imb_ratio", type=str, default=None, help="Imbalance ratio (optional for inat2018)")
     parser.add_argument(
         "--config",
@@ -185,6 +202,10 @@ def main():
         "inat2018": "inat2018",
         "inaturalist": "inat2018",
         "inaturalist2018": "inat2018",
+        "cifar-100": "cifar100",
+        "cifar-10": "cifar10",
+        "imagenet-100": "imagenet100",
+        "imagenet": "imagenet100",
     }
     args.dataset_name = name_map.get(args.dataset_name.lower(), args.dataset_name.lower())
 
@@ -237,6 +258,16 @@ def main():
             slug = slug.strip()
             if slug and slug not in dataset_list:
                 dataset_list.append(slug)
+    if args.dataset_name in ("cifar100", "cifar-100"):
+        for slug in reversed(["minhtmnguyntrn/cifar100-gcd", "fedesoriano/cifar100"]):
+            if slug in dataset_list:
+                dataset_list.remove(slug)
+            dataset_list.insert(0, slug)
+    if args.dataset_name in ("imagenet100", "imagenet-100", "imagenet"):
+        for slug in reversed(["minhtmnguyntrn/imagenet100-cmc"]):
+            if slug in dataset_list:
+                dataset_list.remove(slug)
+            dataset_list.insert(0, slug)
     primary_data_slug = dataset_list[0] if dataset_list else args.dataset_slug
 
     flag_str = " ".join(flags)
@@ -288,10 +319,11 @@ sys.exit(process.returncode)
     with open(staging_dir / "run_script.py", "w", encoding="utf-8") as f:
         f.write(run_script_content)
 
-    # Create kernel-metadata.json
+    # Create kernel-metadata.json (Kaggle API enforces title <= 50 characters)
+    kernel_title = exp_name if len(exp_name) <= 50 else exp_name[:50]
     metadata = {
         "id": f"{kaggle_user}/{kernel_slug}",
-        "title": f"ProtoTail {exp_name}",
+        "title": kernel_title,
         "code_file": "run_script.py",
         "language": "python",
         "kernel_type": "script",

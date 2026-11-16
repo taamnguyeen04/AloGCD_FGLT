@@ -231,11 +231,14 @@ class DistillLoss(nn.Module):
         self.args = args
         self.student_temp = student_temp
         self.ncrops = ncrops
-        self.teacher_temp_schedule = np.concatenate((
-            np.linspace(warmup_teacher_temp,
-                        teacher_temp, warmup_teacher_temp_epochs),
-            np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
-        ))
+        if nepochs <= warmup_teacher_temp_epochs:
+            self.teacher_temp_schedule = np.linspace(warmup_teacher_temp, teacher_temp, nepochs)
+        else:
+            self.teacher_temp_schedule = np.concatenate((
+                np.linspace(warmup_teacher_temp,
+                            teacher_temp, warmup_teacher_temp_epochs),
+                np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
+            ))
 
     def forward(self, student_output, teacher_output, epoch):
         """

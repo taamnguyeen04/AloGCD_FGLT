@@ -1,3 +1,6 @@
+import os
+import tempfile
+import shutil
 from torchvision.datasets import CIFAR10, CIFAR100
 from copy import deepcopy
 import numpy as np
@@ -5,11 +8,37 @@ import torch
 from data.data_utils import subsample_instances
 from config import cifar_100_root, cifar_10_root
 
+def _normalize_cifar_root(root, target_subfolder):
+    if not root:
+        return root
+    clean = str(root).rstrip('/\\')
+    if clean.endswith(target_subfolder):
+        return os.path.dirname(clean)
+    if (os.path.exists(os.path.join(clean, 'train')) or os.path.exists(os.path.join(clean, 'data_batch_1'))) and not os.path.exists(os.path.join(clean, target_subfolder)):
+        proxy_dir = os.path.join(tempfile.gettempdir(), f'cifar_proxy_{target_subfolder}')
+        sub_dir = os.path.join(proxy_dir, target_subfolder)
+        if not os.path.exists(sub_dir):
+            os.makedirs(proxy_dir, exist_ok=True)
+            try:
+                os.symlink(clean, sub_dir, target_is_directory=True)
+            except Exception:
+                os.makedirs(sub_dir, exist_ok=True)
+                for fname in os.listdir(clean):
+                    src_f = os.path.join(clean, fname)
+                    dst_f = os.path.join(sub_dir, fname)
+                    if os.path.isfile(src_f) and not os.path.exists(dst_f):
+                        try:
+                            os.link(src_f, dst_f)
+                        except Exception:
+                            shutil.copyfile(src_f, dst_f)
+        return proxy_dir
+    return clean
+
 class CustomCIFAR10(CIFAR10):
 
-    def __init__(self, sublist=[], *args, **kwargs):
-
-        super(CustomCIFAR10, self).__init__(*args, **kwargs)
+    def __init__(self, root=None, sublist=[], *args, **kwargs):
+        root = _normalize_cifar_root(root or cifar_10_root, 'cifar-10-batches-py')
+        super(CustomCIFAR10, self).__init__(root=root, *args, **kwargs)
 
         self.txt = sublist
         self.uq_idxs = np.array(range(len(self)))
@@ -30,8 +59,9 @@ class CustomCIFAR10(CIFAR10):
 
 class CustomCIFAR100(CIFAR100):
 
-    def __init__(self, sublist=[], return_false_mask=False, return_true_mask=False, *args, **kwargs):
-        super(CustomCIFAR100, self).__init__(*args, **kwargs)
+    def __init__(self, root=None, sublist=[], return_false_mask=False, return_true_mask=False, *args, **kwargs):
+        root = _normalize_cifar_root(root or cifar_100_root, 'cifar-100-python')
+        super(CustomCIFAR100, self).__init__(root=root, *args, **kwargs)
         self.txt = sublist
 
         self.uq_idxs = np.array(range(len(self)))
@@ -112,20 +142,23 @@ def get_lt_dist(cls_num, img_max, imb_factor):
 
 
 def get_cifar_100_datasets(train_transform, test_transform, args=None):
+    root = getattr(args, 'data_root', None) or cifar_100_root
+    splits_root = getattr(args, 'splits_root', None) or 'data_uq_idxs'
 
-    whole_training_set = CustomCIFAR100(root=cifar_100_root, train=True, transform=train_transform, download=True)
+    whole_training_set = CustomCIFAR100(root=root, train=True, transform=train_transform, download=True)
     whole_training_set.target_transform = None
 
-    l_k_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/l_k_uq_idxs.pt', weights_only=False)
-    unl_unk_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/unl_unk_uq_idxs.pt', weights_only=False)
-    unl_k_uq_idxs = torch.load(f'data_uq_idxs/cifar100_k80_imb{args.imb_ratio}/unl_k_uq_idxs.pt', weights_only=False)
+    split_dir = os.path.join(splits_root, f'cifar100_k80_imb{args.imb_ratio}')
+    l_k_uq_idxs = torch.load(os.path.join(split_dir, 'l_k_uq_idxs.pt'), weights_only=False)
+    unl_unk_uq_idxs = torch.load(os.path.join(split_dir, 'unl_unk_uq_idxs.pt'), weights_only=False)
+    unl_k_uq_idxs = torch.load(os.path.join(split_dir, 'unl_k_uq_idxs.pt'), weights_only=False)
 
     train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k_uq_idxs)
     lt_unlabeled_known_dataset = subsample_dataset(deepcopy(whole_training_set), unl_k_uq_idxs)
     lt_unlabeled_unknown_dataset = subsample_dataset(deepcopy(whole_training_set), unl_unk_uq_idxs)
     train_dataset_unlabelled = torch.utils.data.ConcatDataset([lt_unlabeled_known_dataset, lt_unlabeled_unknown_dataset])
 
-    test_dataset = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False)
+    test_dataset = CustomCIFAR100(root=root, transform=test_transform, train=False)
 
     all_datasets = {
         'train_labelled': train_dataset_labelled,
@@ -136,20 +169,23 @@ def get_cifar_100_datasets(train_transform, test_transform, args=None):
     return all_datasets
 
 def get_cifar_10_datasets(train_transform, test_transform, args=None):
+    root = getattr(args, 'data_root', None) or cifar_10_root
+    splits_root = getattr(args, 'splits_root', None) or 'data_uq_idxs'
 
-    whole_training_set = CustomCIFAR10(root=cifar_10_root, train=True, transform=train_transform, download=True)
+    whole_training_set = CustomCIFAR10(root=root, train=True, transform=train_transform, download=True)
     whole_training_set.target_transform = None
 
-    l_k_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/l_k_uq_idxs.pt', weights_only=False)
-    unl_unk_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/unl_unk_uq_idxs.pt', weights_only=False)
-    unl_k_uq_idxs = torch.load(f'data_uq_idxs/cifar10_k5_imb{args.imb_ratio}/unl_k_uq_idxs.pt', weights_only=False)
+    split_dir = os.path.join(splits_root, f'cifar10_k5_imb{args.imb_ratio}')
+    l_k_uq_idxs = torch.load(os.path.join(split_dir, 'l_k_uq_idxs.pt'), weights_only=False)
+    unl_unk_uq_idxs = torch.load(os.path.join(split_dir, 'unl_unk_uq_idxs.pt'), weights_only=False)
+    unl_k_uq_idxs = torch.load(os.path.join(split_dir, 'unl_k_uq_idxs.pt'), weights_only=False)
 
     train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k_uq_idxs)
     lt_unlabeled_known_dataset = subsample_dataset(deepcopy(whole_training_set), unl_k_uq_idxs)
     lt_unlabeled_unknown_dataset = subsample_dataset(deepcopy(whole_training_set), unl_unk_uq_idxs)
     train_dataset_unlabelled = torch.utils.data.ConcatDataset([lt_unlabeled_known_dataset, lt_unlabeled_unknown_dataset])
     
-    test_dataset = CustomCIFAR10(root=cifar_10_root, transform=test_transform, train=False)
+    test_dataset = CustomCIFAR10(root=root, transform=test_transform, train=False)
 
     all_datasets = {
         'train_labelled': train_dataset_labelled,

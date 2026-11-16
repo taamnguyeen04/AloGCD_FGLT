@@ -80,8 +80,14 @@ def get_imagenet_100_datasets(train_transform, test_transform, train_classes=ran
                            prop_train_labels=0.5, split_train_val=False, seed=0, args=None):
 
     from data.LT_dataset import LT_Dataset
+    root = getattr(args, 'data_root', None) or imagenet_root
     txt_path = "splits/imagenet100/imageNet_100_LT_train.txt"
     test_txt_path = "splits/imagenet100/ImageNet_100_test.txt"
+    if root and (os.path.exists(os.path.join(root, "train/n02869837/n02869837_000000.jpg")) or not os.path.exists(os.path.join(root, "train/n02869837/n02869837_7193.JPEG"))):
+        if os.path.exists("splits/imagenet100/imageNet_100_LT_train_cmc.txt"):
+            txt_path = "splits/imagenet100/imageNet_100_LT_train_cmc.txt"
+            test_txt_path = "splits/imagenet100/ImageNet_100_test_cmc.txt"
+
     total_class = 100
     args.anno_ratio = 50
     seed = 416
@@ -90,7 +96,7 @@ def get_imagenet_100_datasets(train_transform, test_transform, train_classes=ran
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    whole_training_set = LT_Dataset(root=imagenet_root, txt=txt_path, transform=train_transform)
+    whole_training_set = LT_Dataset(root=root, txt=txt_path, transform=train_transform)
 
     whole_training_set.target_transform = None
 
@@ -122,7 +128,7 @@ def get_imagenet_100_datasets(train_transform, test_transform, train_classes=ran
                                                      args=args)
 
     # Get test set for all classes
-    test_dataset = LT_Dataset(root=imagenet_root, txt=test_txt_path, transform=test_transform)
+    test_dataset = LT_Dataset(root=root, txt=test_txt_path, transform=test_transform)
 
     # Either split train into train and val or use test set as val
     train_dataset_labelled = lt_labeled_known_dataset

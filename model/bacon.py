@@ -223,6 +223,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     best_test_acc_all_cl = -1
     best_test_acc_old_cl = -1
     best_test_acc_new_cl = -1
+    all_acc_test_cl = None
+    old_acc_test_cl = None
+    new_acc_test_cl = None
     best_unl_acc_all = -1
     best_unl_epoch = -1
     best_epoch = -1
@@ -369,6 +372,14 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         # file stays on disk and is never overwritten by a different epoch).
         best_epoch = int(_ckpt.get('best_epoch', -1))
         best_test_acc_all_cl = float(_ckpt.get('best_all', -1))
+        best_test_acc_old_cl = float(_ckpt.get('best_old', -1))
+        best_test_acc_new_cl = float(_ckpt.get('best_new', -1))
+        if _ckpt.get('current_all') is not None:
+            all_acc_test_cl = float(_ckpt.get('current_all'))
+        if _ckpt.get('current_old') is not None:
+            old_acc_test_cl = float(_ckpt.get('current_old'))
+        if _ckpt.get('current_new') is not None:
+            new_acc_test_cl = float(_ckpt.get('current_new'))
         if float(_ckpt.get('best_unl_all', -1)) > best_unl_acc_all:
             best_unl_acc_all = float(_ckpt.get('best_unl_all'))
             best_unl_epoch = int(_ckpt.get('best_unl_epoch', -1))
@@ -409,6 +420,42 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     set_model(eval=True)
     est_count = dist_est(ce_backbone, cl_backbone, ce_head, train_all_test_trans_loader, args)
     set_model(train=True)
+
+    def _save_last_checkpoint(ep):
+        last_dict = {
+            'epoch': ep,
+            'best_epoch': int(best_epoch),
+            'best_all': float(best_test_acc_all_cl),
+            'best_old': float(best_test_acc_old_cl),
+            'best_new': float(best_test_acc_new_cl),
+            'current_all': float(all_acc_test_cl) if all_acc_test_cl is not None else None,
+            'current_old': float(old_acc_test_cl) if old_acc_test_cl is not None else None,
+            'current_new': float(new_acc_test_cl) if new_acc_test_cl is not None else None,
+            'best_unl_all': float(best_unl_acc_all),
+            'best_unl_epoch': int(best_unl_epoch),
+            'opt_ce': optimizer_ce.state_dict(),
+            'opt_cl': optimizer_cl.state_dict(),
+            'sch_ce': exp_lr_scheduler_ce.state_dict(),
+            'sch_cl': exp_lr_scheduler_cl.state_dict(),
+            'sch_part': (scheduler_part.state_dict()
+                         if scheduler_part is not None else None),
+            'sch_gate': (scheduler_gate.state_dict()
+                         if scheduler_gate is not None else None),
+            'scaler': (scaler.state_dict()
+                       if getattr(args, 'fp16', False) else None),
+            'ce_backbone': ce_backbone.state_dict(),
+            'ce_head': ce_head.state_dict(),
+            'cl_backbone': cl_backbone.state_dict(),
+            'cl_head': cl_head.state_dict(),
+            'part_module': (part_module.state_dict()
+                            if part_module is not None else None),
+            'part_bank': (part_bank.state_dict()
+                          if part_bank is not None else None),
+            'args_backbone': getattr(args, 'backbone', 'unknown'),
+        }
+        last_path = os.path.join(save_path, 'model_last.pt')
+        torch.save(last_dict, last_path)
+        args.logger.info(f'[CHECKPOINT] Saved last checkpoint to {last_path} (epoch {ep + 1}/{args.epochs}).')
 
 
     for epoch in range(start_epoch, args.epochs):
@@ -1047,8 +1094,14 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             torch.save(save_dict_cl, save_path + f'/model_epoch{epoch}.pt')
             args.logger.info("model saved to {}.".format(save_path))
 
+        # Periodic last-checkpoint saving (default: every 5 epochs) & on completion
+        save_freq = int(getattr(args, 'save_freq', 5) or 5)
+        if (epoch + 1) % save_freq == 0 or epoch == args.epochs - 1 or (epoch + 1) >= args.stop_epoch:
+            _save_last_checkpoint(epoch)
+
         _esp = int(getattr(args, 'early_stop_patience', 0) or 0)
         if _esp > 0 and epochs_since_best >= _esp:
+            _save_last_checkpoint(epoch)
             args.logger.info(
                 f'[EARLY-STOP] no new best for {_esp} test rounds '
                 f'(best_ep={best_epoch}, best_all={best_test_acc_all_cl:.1f}). '
@@ -1057,12 +1110,14 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
         _tb = float(getattr(args, 'time_budget_hours', 0) or 0)
         if _tb > 0 and (_time.time() - args._train_t0) / 3600.0 >= _tb:
+            _save_last_checkpoint(epoch)
             args.logger.info(
                 f'[TIME-BUDGET] {_tb}h reached at ep{epoch} '
                 f'(best_ep={best_epoch}). Stopping gracefully + final report.')
             break
 
         if epoch >= args.stop_epoch:
+            _save_last_checkpoint(epoch)
             break
 
     args.logger.info(
@@ -1099,8 +1154,13 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     # ----------------------
     try:
         ckpt_path = os.path.join(save_path, f'model_epoch{best_epoch}.pt')
-        if best_epoch >= 0 and os.path.exists(ckpt_path):
-            args.logger.info(f'\n[FINAL EVAL] Reloading best checkpoint (epoch {best_epoch})...')
+        if not (best_epoch >= 0 and os.path.exists(ckpt_path)):
+            last_path = os.path.join(save_path, 'model_last.pt')
+            if os.path.exists(last_path):
+                ckpt_path = last_path
+                args.logger.info(f'\n[FINAL EVAL] Best checkpoint not found, falling back to {last_path}...')
+        if os.path.exists(ckpt_path):
+            args.logger.info(f'\n[FINAL EVAL] Reloading checkpoint from {ckpt_path}...')
             ckpt = torch.load(ckpt_path, map_location='cuda')
             ce_backbone.load_state_dict(ckpt['ce_backbone'])
             ce_head.load_state_dict(ckpt['ce_head'])
@@ -2415,6 +2475,8 @@ if __name__ == "__main__":
     parser.add_argument('--local-rank', default=-1, type=int)
     parser.add_argument('--p', default=1.1, type=float)
     parser.add_argument('--test-freq', default=1, type=int)
+    parser.add_argument('--save-freq', '--save_freq', dest='save_freq', default=5, type=int,
+                        help="Tan suat (so epoch) de luu model_last.pt (mac dinh: 5).")
     parser.add_argument('--unl-eval-freq', default=None, type=int,
                         help="Tan suat eval tren unlabeled-train pool (GCD protocol). "
                              "None = cung nhac voi --test-freq.")
@@ -2522,8 +2584,11 @@ if __name__ == "__main__":
     else:
         total_class = 100
 
-    args.train_classes = range(args.labeled_classes)
-    args.unlabeled_classes = range(args.labeled_classes, total_class)
+    if hasattr(args, 'train_classes') and args.train_classes is not None and getattr(args, 'labeled_classes', 80) == 80 and args.dataset_name != 'cifar100':
+        args.labeled_classes = len(args.train_classes)
+    else:
+        args.train_classes = range(args.labeled_classes)
+    args.unlabeled_classes = range(len(args.train_classes), total_class)
 
     args.num_labeled_classes = len(args.train_classes)
     args.num_unlabeled_classes = len(args.unlabeled_classes)
