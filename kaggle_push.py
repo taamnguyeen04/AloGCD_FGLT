@@ -1,9 +1,22 @@
-"""Kaggle Kernel Push Launcher.
+"""Kaggle Kernel Push Launcher (BaCon trainer, Modal-parity).
 
-Automatically packages prototail code as a self-contained bundle,
-creates kernel-metadata.json, and pushes to Kaggle to trigger GPU T4
-background training (Save & Run All).
-You can shut down your PC immediately after running this script.
+Packages the CURRENT BaCon repo (``model/bacon.py`` trainer — the exact same
+code that ``modal_train.py`` runs on Modal) into a self-contained bundle,
+creates kernel-metadata.json, and pushes to Kaggle to trigger background GPU
+training (Save & Run All). You can shut down your PC immediately after.
+
+The legacy ``gcd-hosts/prototail`` code is NOT used anywhere anymore:
+  - trainer            -> python -m model.bacon  (same flags/config map as Modal)
+  - bundle             -> model/ + data/ + util/ + config.py + runner +
+                          data_uq_idxs/<target dataset> (+ splits/ for imagenet)
+  - config mapping     -> identical to modal_train.launch()
+  - results            -> /kaggle/working/outputs/experiments/<run_name>/...
+
+Usage (same CLI habit as before):
+    python kaggle_push.py --baseline bacon --dataset-name cars --imb-ratio 50 --config Full_wo_Tail
+    python kaggle_push.py --baseline bacon --dataset-name herb19 --imb-ratio 100 --config Full
+Extra bacon.py flags can be forwarded with --extra-args "...". --baseline is
+informational only (the BaCon trainer is always used, exactly like Modal).
 """
 
 import argparse
@@ -17,7 +30,6 @@ import sys
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 import zipfile
-from datetime import datetime
 from pathlib import Path
 
 
@@ -47,106 +59,99 @@ def _get_active_kaggle_username() -> str:
     return "minhtmnguyntrn"
 
 
-def _build_code_bundle_b64(repo_root: Path, target_dataset: str = "", target_imb: int | str = "") -> str:
-    """Zip kaggle_train.py, src/, configs/, and dataset-specific splits into an in-memory base64 payload."""
-    buf = io.BytesIO()
-    prototail_candidates = [
-        repo_root,
-        Path(r"C:\Users\tam\Documents\GitHub\gcd-hosts\prototail"),
-        repo_root.parent / "gcd-hosts" / "prototail",
-        repo_root.parent / "prototail",
+def _split_prefixes(dataset: str) -> list:
+    dl = (dataset or "").lower()
+    if "cub" in dl:
+        return ["cub", "cub200"]
+    if "car" in dl:
+        return ["car", "cars196", "cars"]
+    if "air" in dl:
+        return ["air", "aircraft"]
+    if "herb" in dl:
+        return ["herb", "herbarium19", "herbarium"]
+    if "inat" in dl:
+        return ["inat", "inat2018"]
+    if "imagenet" in dl:
+        return []  # imagenet uses splits/ txt lists, not data_uq_idxs
+    return [dl] if dl else []
+
+
+def _build_code_bundle_b64(repo_root: Path, target_dataset: str = "", target_imb: str | None = None) -> str:
+    """Zip the BaCon trainer code (this repo only) + target-dataset splits into a b64 payload.
+
+    Contents (zip root = repo layout expected by kaggle_run_bacon.py):
+      kaggle_run_bacon.py  runner (locates datasets, sets env, builds modal-parity cmd)
+      config.py            env-var data roots
+      model/ data/ util/   trainer + loaders + utils (data/augmentations pkg included)
+      data_uq_idxs/<target dataset split dirs>   (relative split files for imb datasets)
+      splits/              (imagenet only)
+    """
+    required = [
+        repo_root / "kaggle_run_bacon.py",
+        repo_root / "config.py",
+        repo_root / "model",
+        repo_root / "data",
+        repo_root / "util",
     ]
-    p_root = None
-    for c in prototail_candidates:
-        if (c / "src/prototail_gcd/train.py").is_file():
-            p_root = c
-            break
-    if p_root is None:
-        raise FileNotFoundError("Could not find prototail source root directory")
+    missing = [str(p) for p in required if not (p.is_file() or p.is_dir())]
+    if missing:
+        raise FileNotFoundError("Missing BaCon repo files: " + ", ".join(missing))
 
+    buf = io.BytesIO()
+    n_files = 0
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        # 1. kaggle_train.py
-        z.write(p_root / "kaggle_train.py", "kaggle_train.py")
-        # 2. src/
-        for root, dirs, files in os.walk(p_root / "src"):
-            if "__pycache__" in root:
-                continue
-            for f in files:
-                p = Path(root) / f
-                z.write(p, p.relative_to(p_root))
-        # 3. configs/
-        for root, dirs, files in os.walk(p_root / "configs"):
-            if "__pycache__" in root:
-                continue
-            for f in files:
-                p = Path(root) / f
-                z.write(p, p.relative_to(p_root))
+        def add_file(path: Path, arcname: str):
+            nonlocal n_files
+            src = path.read_bytes()
+            if path.suffix == ".py":
+                compile(src, str(path), "exec")  # syntax-check before shipping
+            z.writestr(arcname, src)
+            n_files += 1
 
-        # 4. data_uq_idxs/ (pack only the target dataset's splits to stay under Kaggle's 1MB limit)
-        splits_candidates = [
-            p_root / "data_uq_idxs",
-            repo_root / "data_uq_idxs",
-            Path(r"C:\Users\tam\Documents\GitHub\gcd-hosts\prototail\data_uq_idxs"),
-            Path(r"C:\Users\tam\Documents\GitHub\BaCon\data_uq_idxs"),
-        ]
-        s_dir = None
-        for cand in splits_candidates:
-            if cand.is_dir():
-                s_dir = cand
-                break
-        if s_dir is not None:
-            dname_lower = (target_dataset or "").lower()
-            prefixes = [dname_lower] if dname_lower else []
-            if "cub" in dname_lower:
-                prefixes.extend(["cub", "cub200"])
-            elif "car" in dname_lower:
-                prefixes.extend(["car", "cars196", "cars"])
-            elif "air" in dname_lower:
-                prefixes.extend(["air", "aircraft"])
-            elif "herb" in dname_lower:
-                prefixes.extend(["herb", "herbarium19", "herbarium"])
-            elif "inat" in dname_lower:
-                prefixes.extend(["inat", "inat2018"])
-            elif "cifar100" in dname_lower:
-                prefixes.append("cifar100")
-            elif "cifar10" in dname_lower:
-                prefixes.append("cifar10")
+        def walk_dir(src_dir: Path):
+            for root, dirs, files in os.walk(src_dir):
+                dirs[:] = [d for d in dirs if d != "__pycache__"]
+                for f in sorted(files):
+                    if f.endswith(".pyc"):
+                        continue
+                    p = Path(root) / f
+                    add_file(p, p.relative_to(repo_root).as_posix())
 
-            for child in s_dir.iterdir():
-                if not child.is_dir():
+        add_file(repo_root / "kaggle_run_bacon.py", "kaggle_run_bacon.py")
+        add_file(repo_root / "config.py", "config.py")
+        walk_dir(repo_root / "model")
+        walk_dir(repo_root / "data")
+        walk_dir(repo_root / "util")
+
+        # data_uq_idxs/ — pack only the target dataset's split dirs (keep bundle < ~1MB)
+        s_dir = repo_root / "data_uq_idxs"
+        prefixes = _split_prefixes(target_dataset)
+        if s_dir.is_dir() and prefixes:
+            for child in sorted(s_dir.iterdir()):
+                if not child.is_dir() or not any(child.name.lower().startswith(p) for p in prefixes):
                     continue
                 cname = child.name.lower()
-                if prefixes and not any(cname.startswith(p) for p in prefixes):
-                    continue
-                if target_imb and ("inat" in cname or "herbarium" in cname):
-                    imb_tag = "natural" if str(target_imb).lower() == "natural" else f"imb{target_imb}"
-                    if imb_tag not in cname:
+                # herbarium/inat splits are name-tagged; allow either the requested imb tag or 'natural'
+                if ("herbarium" in cname or "inat" in cname) and target_imb not in (None, "", "natural"):
+                    if f"imb{target_imb}" not in cname and "natural" not in cname:
                         continue
                 for root, dirs, files in os.walk(child):
-                    if "__pycache__" in root:
-                        continue
-                    for f in files:
+                    dirs[:] = [d for d in dirs if d != "__pycache__"]
+                    for f in sorted(files):
                         p = Path(root) / f
-                        arcname = "data_uq_idxs/" + p.relative_to(s_dir).as_posix()
-                        z.write(p, arcname)
+                        add_file(p, "data_uq_idxs/" + p.relative_to(s_dir).as_posix())
 
-        # 4b. splits/ (pack splits/imagenet100 when targeting imagenet)
-        dname_lower = (target_dataset or "").lower()
-        if "imagenet" in dname_lower:
-            splits_dir = None
-            for cand_sp in [p_root / "splits", repo_root / "splits", Path(r"C:\Users\tam\Documents\GitHub\BaCon\splits")]:
-                if cand_sp.is_dir():
-                    splits_dir = cand_sp
-                    break
-            if splits_dir is not None:
+        # splits/ — imagenet only
+        if "imagenet" in (target_dataset or "").lower():
+            splits_dir = repo_root / "splits"
+            if splits_dir.is_dir():
                 for root, dirs, files in os.walk(splits_dir):
-                    if "__pycache__" in root:
-                        continue
-                    for f in files:
+                    dirs[:] = [d for d in dirs if d != "__pycache__"]
+                    for f in sorted(files):
                         p = Path(root) / f
-                        arcname = "splits/" + p.relative_to(splits_dir).as_posix()
-                        z.write(p, arcname)
+                        add_file(p, "splits/" + p.relative_to(splits_dir).as_posix())
 
+    print(f"[bundle] {n_files} files packed ({len(buf.getvalue())/1024:.1f} KB raw)")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -157,7 +162,6 @@ def _safe_clean_staging_dir(staging_dir: Path) -> None:
             shutil.rmtree(staging_dir, ignore_errors=True)
         except Exception:
             pass
-    # If the directory still exists (e.g. held by an active handle or indexing), clean remaining children
     if staging_dir.exists():
         for child in staging_dir.iterdir():
             try:
@@ -171,19 +175,49 @@ def _safe_clean_staging_dir(staging_dir: Path) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Push ProtoTail training job to Kaggle GPU")
-    parser.add_argument("--baseline", choices=["simgcd", "bacon"], default="simgcd")
-    parser.add_argument("--dataset-name", "--dataset_name", dest="dataset_name", choices=["cub", "cub200", "cars", "car", "scars", "aircraft", "air", "fgvc_aircraft", "herbarium", "herbarium19", "herb19", "inat", "inat2018", "inaturalist", "inaturalist2018", "cifar100", "cifar-100", "cifar10", "cifar-10", "imagenet100", "imagenet-100", "imagenet"], default="cub")
-    parser.add_argument("--imb-ratio", "--imb_ratio", dest="imb_ratio", type=str, default=None, help="Imbalance ratio (optional for inat2018)")
-    parser.add_argument(
-        "--config",
-        choices=["Base", "Pseudo", "Prototype", "Prototype_Tailaware", "Full_wo_Tail", "Full"],
-        default="Base",
-    )
-    parser.add_argument("--kmeans-backend", choices=["sklearn_cpu", "faiss_gpu"], default="sklearn_cpu", help="KMeans clustering backend (default: sklearn_cpu)")
+    parser = argparse.ArgumentParser(description="Push BaCon (model/bacon.py, modal parity) training job to Kaggle GPU")
+    parser.add_argument("--baseline", choices=["bacon", "simgcd"], default="bacon",
+                        help="informational only — the BaCon trainer is always used (like modal_train.py)")
+    parser.add_argument("--dataset-name", "--dataset_name", dest="dataset_name",
+                        choices=["cub", "cub200", "cars", "car", "scars", "aircraft", "air", "fgvc_aircraft",
+                                 "herbarium", "herbarium19", "herb19", "inat", "inat2018", "inaturalist",
+                                 "inaturalist2018", "cifar100", "cifar-100", "cifar10", "cifar-10",
+                                 "imagenet100", "imagenet-100", "imagenet"],
+                        default="cub")
+    parser.add_argument("--imb-ratio", "--imb_ratio", dest="imb_ratio", type=str, default=None,
+                        help="Imbalance ratio (natural/omitted only for inat2018; herb19 uses natural split internally)")
+    parser.add_argument("--config", choices=["Base", "Pseudo", "Prototype", "Prototype_Tailaware",
+                                             "Full_wo_Tail", "Full"], default="Base",
+                        help="same mapping as modal_train.launch()")
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--eval-interval", "--eval_interval", dest="eval_interval", type=int, default=5)
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=128)
+    parser.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=-1)
+    parser.add_argument("--backbone", default="dinov2_vitb14")
+    parser.add_argument("--vis-freq", "--vis_freq", dest="vis_freq", type=int, default=0,
+                        help="PCA/t-SNE vis interval on Kaggle (0 = off, saves time+quota)")
+    parser.add_argument("--save-freq", "--save_freq", dest="save_freq", type=int, default=20,
+                        help="epoch checkpoint interval (default 20; bacon.py default 5 would blow the 20GB quota)")
+    parser.add_argument("--time-budget-hours", dest="time_budget_hours", type=float, default=8.5,
+                        help="graceful stop before Kaggle's ~9h GPU session cap (0 = disabled)")
+    parser.add_argument("--early-stop-patience", dest="early_stop_patience", type=int, default=50)
+    parser.add_argument("--resume-ckpt", dest="resume_ckpt", default="",
+                        help="checkpoint path readable in-container, e.g. /kaggle/input/<dataset>/outputs/experiments/<run>/checkpoints/model_best.pt")
+    parser.add_argument("--fp16", action="store_true", help="AMP mixed precision (fallback if T4/P100 OOM)")
+    parser.add_argument("--use-logit-adjust", dest="use_logit_adjust", action="store_true")
+    parser.add_argument("--use-momentum-teacher", dest="use_momentum_teacher", action="store_true")
+    parser.add_argument("--teacher-m0", dest="teacher_m0", type=float, default=0.996)
+    parser.add_argument("--extra-args", dest="extra_args", default="",
+                        help="raw extra flags forwarded to bacon.py (overrides config-derived flags)")
+    parser.add_argument("--exp-name-suffix", dest="exp_name_suffix", default="",
+                        help="suffix appended to the experiment/run name")
+    # legacy flags accepted for CLI habit compatibility; no-ops on the BaCon path
+    parser.add_argument("--kmeans-backend", choices=["sklearn_cpu", "faiss_gpu"], default="sklearn_cpu",
+                        help="(ignored — BaCon trainer always uses sklearn KMeans)")
+    parser.add_argument("--eval-interval", "--eval_interval", dest="eval_interval", type=int, default=5,
+                        help="(ignored — BaCon uses --est-freq 10 like Modal)")
+    # Kaggle plumbing
     parser.add_argument("--kaggle-user", "--kaggle_user", dest="kaggle_user", type=str, default=None)
     parser.add_argument("--dataset-slug", "--dataset_slug", dest="dataset_slug", type=str, default="nguyntrnminhtm/gcd-data")
     parser.add_argument("--extra-datasets", "--extra_datasets", dest="extra_datasets", type=str, default=None,
@@ -191,63 +225,48 @@ def main():
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run", action="store_true", help="Build kernel locally without pushing")
     args = parser.parse_args()
     name_map = {
-        "car": "cars",
-        "scars": "cars",
-        "air": "aircraft",
-        "fgvc_aircraft": "aircraft",
-        "cub200": "cub",
-        "herbarium": "herbarium19",
-        "herb19": "herbarium19",
-        "inat": "inat2018",
-        "inat2018": "inat2018",
-        "inaturalist": "inat2018",
-        "inaturalist2018": "inat2018",
-        "cifar-100": "cifar100",
-        "cifar-10": "cifar10",
-        "imagenet-100": "imagenet100",
-        "imagenet": "imagenet100",
+        "car": "cars", "scars": "cars", "air": "aircraft", "fgvc_aircraft": "aircraft",
+        "cub200": "cub", "herbarium": "herbarium19", "herb19": "herbarium19",
+        "inat": "inat2018", "inaturalist": "inat2018", "inaturalist2018": "inat2018",
+        "cifar-100": "cifar100", "cifar-10": "cifar10",
+        "imagenet-100": "imagenet100", "imagenet": "imagenet100",
     }
-    args.dataset_name = name_map.get(args.dataset_name.lower(), args.dataset_name.lower())
+    dataset_name = name_map.get(args.dataset_name.lower(), args.dataset_name.lower())
 
     repo_root = Path(__file__).resolve().parent
     kaggle_user = args.kaggle_user or _get_active_kaggle_username()
 
-    # Determine flags based on config
-    flags = []
-    if args.config == "Base":
-        pass
-    elif args.config == "Pseudo":
-        flags.extend(["--enable-pseudo-labeling", "--enable-novel-pseudo"])
-    elif args.config == "Prototype":
-        flags.extend(["--use-parts", "--ablate-adaptive-capacity"])
-    elif args.config == "Prototype_Tailaware":
-        flags.extend(["--use-parts", "--gate-warm-start-from-support"])
-    elif args.config == "Full_wo_Tail":
-        flags.extend(["--use-parts", "--ablate-adaptive-capacity", "--enable-pseudo-labeling", "--enable-novel-pseudo"])
-    elif args.config == "Full":
-        flags.extend(["--use-parts", "--enable-pseudo-labeling", "--enable-novel-pseudo", "--gate-warm-start-from-support"])
-
-    is_natural = (args.dataset_name in ("inat", "inat2018", "inaturalist", "inaturalist2018")) and (args.imb_ratio is None or str(args.imb_ratio).lower() in ("natural", "none", "0", ""))
+    # natural imbalance only applies to inat2018 (herb19 is natural inside its loader)
+    is_inat = dataset_name == "inat2018"
+    is_natural = is_inat and (args.imb_ratio is None or str(args.imb_ratio).lower() in ("natural", "none", "0", ""))
     if is_natural:
-        args.imb_ratio = None
-        exp_name = f"{args.baseline}_{args.dataset_name}_{args.config}"
-        kernel_slug = f"prototail-{args.baseline}-{args.dataset_name}-{args.config.lower()}".replace("_", "-")
+        imb_ratio = None
+    elif args.imb_ratio is None:
+        imb_ratio = "20"
     else:
-        if args.imb_ratio is None:
-            args.imb_ratio = "20"
-        exp_name = f"{args.baseline}_{args.dataset_name}_{args.config}_imb{args.imb_ratio}"
-        kernel_slug = f"prototail-{args.baseline}-{args.dataset_name}-{args.config.lower()}-imb{args.imb_ratio}".replace("_", "-")
+        imb_ratio = str(args.imb_ratio).strip().lower()
+        if not imb_ratio.isdigit():
+            if is_inat and imb_ratio in ("natural", "none", ""):
+                imb_ratio = None
+            else:
+                parser.error(f"--imb-ratio must be an integer (got '{args.imb_ratio}')")
 
-    # Staging folder for kernel push
+    exp_name = f"{args.baseline}_{dataset_name}_{args.config}"
+    if imb_ratio is not None:
+        exp_name += f"_imb{imb_ratio}"
+    if args.exp_name_suffix:
+        exp_name += f"_{args.exp_name_suffix}"
+    kernel_slug = exp_name.lower().replace("_", "-")
+
     staging_dir = repo_root / "build_kaggle_kernel"
     _safe_clean_staging_dir(staging_dir)
 
-    # Build self-contained code bundle
-    print("Packaging ProtoTail codebase into self-contained bundle...")
-    b64_bundle = _build_code_bundle_b64(repo_root, target_dataset=args.dataset_name, target_imb=args.imb_ratio)
+    print("Packaging BaCon trainer code (model/bacon.py, modal parity)...")
+    b64_bundle = _build_code_bundle_b64(repo_root, target_dataset=dataset_name, target_imb=imb_ratio)
+    if len(b64_bundle) > 900_000:
+        print(f"[WARN] bundle b64 is {len(b64_bundle)} chars — may exceed Kaggle's 1MB kernel file limit")
 
-    # Generate self-unpacking runner script for Kaggle
-    # Collect all dataset sources
+    # Kaggle dataset sources attached to the kernel
     dataset_list = []
     for slug in args.dataset_slug.split(","):
         slug = slug.strip()
@@ -258,22 +277,52 @@ def main():
             slug = slug.strip()
             if slug and slug not in dataset_list:
                 dataset_list.append(slug)
-    if args.dataset_name in ("cifar100", "cifar-100"):
+    if dataset_name == "cifar100":
         for slug in reversed(["minhtmnguyntrn/cifar100-gcd", "fedesoriano/cifar100"]):
             if slug in dataset_list:
                 dataset_list.remove(slug)
             dataset_list.insert(0, slug)
-    if args.dataset_name in ("imagenet100", "imagenet-100", "imagenet"):
+    if dataset_name == "imagenet100":
         for slug in reversed(["minhtmnguyntrn/imagenet100-cmc"]):
             if slug in dataset_list:
                 dataset_list.remove(slug)
             dataset_list.insert(0, slug)
-    primary_data_slug = dataset_list[0] if dataset_list else args.dataset_slug
 
-    flag_str = " ".join(flags)
-    run_script_content = f'''# Self-contained ProtoTail runner for Kaggle GPU
+    # runner command line (executed inside the kernel after unpacking)
+    runner_args = [
+        "kaggle_run_bacon.py",
+        "--dataset-name", dataset_name,
+        "--config", args.config,
+        "--epochs", str(args.epochs),
+        "--batch-size", str(args.batch_size),
+        "--num-workers", str(args.num_workers),
+        "--backbone", args.backbone,
+        "--vis-freq", str(args.vis_freq),
+        "--save-freq", str(args.save_freq),
+        "--time-budget-hours", str(args.time_budget_hours),
+        "--early-stop-patience", str(args.early_stop_patience),
+        "--run-name", exp_name,
+        "--imb-ratio", str(imb_ratio if imb_ratio is not None else (100 if is_inat else 20)),
+    ]
+    if args.lr is not None:
+        runner_args += ["--lr", str(args.lr)]
+    if args.seed is not None and args.seed >= 0:
+        runner_args += ["--seed", str(args.seed)]
+    if args.fp16:
+        runner_args += ["--fp16"]
+    if args.use_logit_adjust:
+        runner_args += ["--use-logit-adjust"]
+    if args.use_momentum_teacher:
+        runner_args += ["--use-momentum-teacher", "--teacher-m0", str(args.teacher_m0)]
+    if args.resume_ckpt:
+        runner_args += ["--resume-ckpt", args.resume_ckpt]
+    if args.extra_args:
+        runner_args += ["--extra-args", args.extra_args]
+
+    run_script_content = f'''# Self-contained BaCon runner for Kaggle GPU (modal_train.py parity)
 import base64
 import io
+import json
 import os
 import subprocess
 import sys
@@ -281,45 +330,29 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 import zipfile
 
-# 1. Unpack code bundle directly into current working directory
+# 1. Unpack the BaCon code bundle into the current working directory (/kaggle/working)
 BUNDLE_B64 = """{b64_bundle}"""
 target_dir = os.getcwd()
-print(f"[Kaggle Bootstrap] Unpacking ProtoTail code into {{target_dir}}...")
+print(f"[Kaggle Bootstrap] Unpacking BaCon code into {{target_dir}}...")
 with zipfile.ZipFile(io.BytesIO(base64.b64decode(BUNDLE_B64.encode("ascii")))) as z:
     z.extractall(target_dir)
 
-print("[Kaggle Bootstrap] Code unpacked successfully. Available files:")
-for item in os.listdir(target_dir):
+print("[Kaggle Bootstrap] Code unpacked. Top-level files:")
+for item in sorted(os.listdir(target_dir)):
     print(" -", item)
 sys.stdout.flush()
 
-# 2. Execute training
-cmd = [
-    sys.executable,
-    os.path.join(target_dir, "kaggle_train.py"),
-    "--baseline", "{args.baseline}",
-    "--dataset-slug", "{primary_data_slug}",
-    "--dataset-name", "{args.dataset_name}",
-    "--imb-ratio", "{args.imb_ratio}",
-    "--epochs", "{args.epochs}",
-    "--eval-interval", "{args.eval_interval}",
-    "--batch-size", "{args.batch_size}",
-    "--run-name", "{exp_name}",
-    "--kmeans-backend", "{args.kmeans_backend}",
-]
-extra_flags = {flags}
-cmd.extend(extra_flags)
+# 2. Run the BaCon trainer (model/bacon.py) with modal_train.py-equivalent arguments
+cmd = [sys.executable] + {json.dumps(runner_args)}
 
-print("\\n[Kaggle Runner] Launching command:\\n" + " ".join(cmd) + "\\n")
+print("\\n[Kaggle Runner] Launching:\\n" + " ".join(cmd) + "\\n")
 sys.stdout.flush()
-
 process = subprocess.run(cmd)
 sys.exit(process.returncode)
 '''
     with open(staging_dir / "run_script.py", "w", encoding="utf-8") as f:
         f.write(run_script_content)
 
-    # Create kernel-metadata.json (Kaggle API enforces title <= 50 characters)
     kernel_title = exp_name if len(exp_name) <= 50 else exp_name[:50]
     metadata = {
         "id": f"{kaggle_user}/{kernel_slug}",
@@ -339,24 +372,38 @@ sys.exit(process.returncode)
         json.dump(metadata, f, indent=2)
 
     print("=" * 65)
-    print("        PROTOTAIL KAGGLE CLI PUSH LAUNCHER")
+    print("        BACON KAGGLE CLI PUSH LAUNCHER (modal_train.py parity)")
     print("=" * 65)
     print(f"Active Account:  {kaggle_user}")
     print(f"Kernel ID:       {kaggle_user}/{kernel_slug}")
-    print(f"Configuration:   {exp_name}")
-    print(f"Baseline:        {args.baseline.upper()}")
-    print(f"Dataset:         {args.dataset_name.upper()} (imb={args.imb_ratio})")
-    print(f"Config Ablation: {args.config}")
-    print(f"Flags:           {flag_str or '(none - pure baseline)'}")
-    print(f"GPU:             NVIDIA T4 (enable_gpu: true)")
+    print(f"Experiment:      {exp_name}")
+    print(f"Baseline:        {args.baseline.upper()} (informational — BaCon trainer always used)")
+    print(f"Dataset:         {dataset_name.upper()} (imb={imb_ratio if imb_ratio is not None else 'natural'})")
+    print(f"Config Ablation: {args.config}  (modal launch() mapping)")
+    print(f"Trainer:         python -m model.bacon  (current repo code, same as Modal)")
+    print(f"GPU:             Kaggle T4x2 / P100 (enable_gpu: true; add --fp16 or lower --batch-size if OOM)")
+    print(f"Time budget:     {args.time_budget_hours}h | save-freq {args.save_freq} | vis-freq {args.vis_freq} | workers {args.num_workers}")
     print(f"Code Payload:    {len(b64_bundle)} chars (~{len(b64_bundle)//1024} KB self-extracting)")
     print("=" * 65)
+
+    # Validate locally: let the runner build (and print) the exact command it will run
+    print("\n[Dry-run validation] runner builds the exact command:")
+    validation = subprocess.run(
+        [sys.executable, str(repo_root / "kaggle_run_bacon.py"), *runner_args[1:], "--dry-run"],
+        cwd=str(repo_root), capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    out = (validation.stdout or "") + (validation.stderr or "")
+    print(out.strip() if out.strip() else "(no output)")
+    if validation.returncode != 0:
+        print("\n[ERROR] runner validation failed — aborting (fix the error above).")
+        sys.exit(1)
+
     if args.dry_run:
         print("\n[DRY RUN] Kernel packaged successfully at:", staging_dir)
         return
+
     print("\nPushing kernel to Kaggle...")
     sys.stdout.flush()
-
     cmd_push = ["kaggle", "kernels", "push", "-p", str(staging_dir)]
     res = subprocess.run(cmd_push, capture_output=True, text=True)
     if res.stdout:
@@ -369,7 +416,7 @@ sys.exit(process.returncode)
         print("\n[INFO] Detected 409 title conflict (soft-deleted notebook). Retrying with unique timestamp suffix...")
         import time
         ts_suffix = str(int(time.time()))[-4:]
-        metadata["title"] = f"ProtoTail {exp_name} {ts_suffix}"
+        metadata["title"] = f"BaCon {exp_name} {ts_suffix}"
         metadata["id"] = f"{kaggle_user}/{kernel_slug}-{ts_suffix}"
         with open(staging_dir / "kernel-metadata.json", "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
@@ -382,14 +429,19 @@ sys.exit(process.returncode)
 
     if res.returncode == 0 and "Kernel push error:" not in combined_output:
         print("\n" + "=" * 65)
-        print("  >>> SUCCESS! Kernel successfully pushed to Kaggle GPU <<<")
-        print(f"  Background training on T4 GPU for: {kaggle_user}")
-        print(f"  Status check: kaggle kernels status {kaggle_user}/{kernel_slug}")
+        print("  >>> SUCCESS! Kernel pushed — background training started <<<")
+        print(f"  Trainer: model/bacon.py (current repo code, same as Modal)")
+        print(f"  Status : kaggle kernels status {kaggle_user}/{kernel_slug}")
+        print(f"  Results: kaggle kernels output {kaggle_user}/{kernel_slug} -p <dir>")
+        print(f"           -> outputs/experiments/{exp_name}/ (log, final_report, checkpoints)")
+        print("  Resume : attach the finished kernel's output as a dataset, then")
+        print("           --resume-ckpt /kaggle/input/<dataset>/outputs/experiments/")
+        print(f"                  {exp_name}/checkpoints/model_best.pt")
         print("=" * 65)
     else:
         print("\n" + "=" * 65)
-        print(f"  >>> PUSH FAILED! Kaggle rejected the kernel push <<<")
-        print(f"  Reason: Check the error above (e.g. GPU session quota or credentials).")
+        print("  >>> PUSH FAILED! Kaggle rejected the kernel push <<<")
+        print("  Reason: check the error above (e.g. GPU quota or credentials).")
         print("=" * 65)
 
 
