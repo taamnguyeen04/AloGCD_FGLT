@@ -33,8 +33,78 @@ import zipfile
 from pathlib import Path
 
 
+def _switch_kaggle_token(target_user: str) -> bool:
+    """Switch active Kaggle token (~/.kaggle/access_token) to match target_user (tamXX or username)."""
+    base = Path(os.environ.get("APPDATA", "")) / "com.alogpu.app" / "kaggle" / "accounts"
+    if not base.is_dir():
+        return False
+    matched_dir = None
+    target_clean = target_user.strip().lower()
+    for d in base.iterdir():
+        if d.is_dir():
+            if d.name.lower() == target_clean:
+                matched_dir = d
+                break
+            af = d / "account.json"
+            if af.is_file():
+                try:
+                    with open(af, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if (data.get("username", "").lower() == target_clean
+                                or data.get("id", "").lower() == target_clean
+                                or data.get("label", "").lower() == target_clean):
+                            matched_dir = d
+                            break
+                except Exception:
+                    pass
+    if matched_dir and (matched_dir / "token").is_file():
+        dst = Path.home() / ".kaggle" / "access_token"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(matched_dir / "token", dst)
+        print(f"[auth] Switched Kaggle token to AloGPU account: {matched_dir.name}")
+        return True
+    return False
+
+
+def _get_alogpu_account_map() -> dict:
+    """Read all account mappings (tam01 -> username) from AloGPU config if present."""
+    acc_map = {}
+    base = Path(os.environ.get("APPDATA", "")) / "com.alogpu.app" / "kaggle" / "accounts"
+    if base.is_dir():
+        for d in base.iterdir():
+            af = d / "account.json"
+            if af.is_file():
+                try:
+                    with open(af, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        u = data.get("username")
+                        aid = data.get("id")
+                        lbl = data.get("label")
+                        if u:
+                            if aid:
+                                acc_map[aid.lower()] = u
+                            if lbl:
+                                acc_map[lbl.lower()] = u
+                            acc_map[u.lower()] = u
+                except Exception:
+                    pass
+    return acc_map
+
+
 def _get_active_kaggle_username() -> str:
-    """Read active Kaggle username from kaggle CLI / credentials."""
+    """Read active Kaggle username from AloGPU, kaggle CLI, or credentials."""
+    # 1. AloGPU active account (from C:\Users\<user>\AppData\Roaming\com.alogpu.app\kaggle\active.json)
+    active_json = Path(os.environ.get("APPDATA", "")) / "com.alogpu.app" / "kaggle" / "active.json"
+    if active_json.is_file():
+        try:
+            with open(active_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("username"):
+                    return str(data["username"])
+        except Exception:
+            pass
+
+    # 2. kaggle library config
     try:
         import kaggle
         cfg = getattr(kaggle.api, "config_values", {}) or {}
@@ -43,10 +113,14 @@ def _get_active_kaggle_username() -> str:
             return str(username)
     except Exception:
         pass
+
+    # 3. Environment variables
     for k in ("KAGGLE_USERNAME", "KAGGLE_USER_NAME", "KAGGLE_USER"):
         v = os.environ.get(k)
         if v:
             return v
+
+    # 4. ~/.kaggle/kaggle.json
     kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
     if kaggle_json.is_file():
         try:
@@ -56,6 +130,7 @@ def _get_active_kaggle_username() -> str:
                     return str(data["username"])
         except Exception:
             pass
+
     return "minhtmnguyntrn"
 
 
@@ -122,6 +197,13 @@ def _build_code_bundle_b64(repo_root: Path, target_dataset: str = "", target_imb
         walk_dir(repo_root / "model")
         walk_dir(repo_root / "data")
         walk_dir(repo_root / "util")
+        # root-level modules duoc model/data/util import (vd model/dist_est.py
+        # -> from logits_adj_utils import ...). Modal bake ca repo nen khong
+        # gap; Kaggle bundle phai pack ro.
+        for _root_mod in ("logits_adj_utils.py",):
+            _p = repo_root / _root_mod
+            if _p.is_file():
+                add_file(_p, _root_mod)
 
         # data_uq_idxs/ — pack only the target dataset's split dirs (keep bundle < ~1MB)
         s_dir = repo_root / "data_uq_idxs"
@@ -204,6 +286,10 @@ def main():
     parser.add_argument("--early-stop-patience", dest="early_stop_patience", type=int, default=50)
     parser.add_argument("--resume-ckpt", dest="resume_ckpt", default="",
                         help="checkpoint path readable in-container, e.g. /kaggle/input/<dataset>/outputs/experiments/<run>/checkpoints/model_best.pt")
+    parser.add_argument("--resume-kernel", "--parent-kernel", dest="resume_kernel", type=str, default="",
+                        help="Previous Kaggle kernel slug or ID (e.g. 'tam11/bacon-cifar100-base-imb20' or 'bacon-cifar100-base-imb20') to attach as input and resume from")
+    parser.add_argument("--public", action="store_true", default=False,
+                        help="Make the kernel Public (allows any other Kaggle account to mount its checkpoints and continue training)")
     parser.add_argument("--fp16", action="store_true", help="AMP mixed precision (fallback if T4/P100 OOM)")
     parser.add_argument("--use-logit-adjust", dest="use_logit_adjust", action="store_true")
     parser.add_argument("--use-momentum-teacher", dest="use_momentum_teacher", action="store_true")
@@ -234,7 +320,11 @@ def main():
     dataset_name = name_map.get(args.dataset_name.lower(), args.dataset_name.lower())
 
     repo_root = Path(__file__).resolve().parent
-    kaggle_user = args.kaggle_user or _get_active_kaggle_username()
+    alogpu_map = _get_alogpu_account_map()
+    if args.kaggle_user:
+        _switch_kaggle_token(args.kaggle_user)
+    raw_user = args.kaggle_user or _get_active_kaggle_username()
+    kaggle_user = alogpu_map.get(raw_user.lower(), raw_user)
 
     # natural imbalance only applies to inat2018 (herb19 is natural inside its loader)
     is_inat = dataset_name == "inat2018"
@@ -287,6 +377,36 @@ def main():
             if slug in dataset_list:
                 dataset_list.remove(slug)
             dataset_list.insert(0, slug)
+
+    # Handle cross-kernel resume (auto-mount parent kernel output)
+    kernel_sources = []
+    rk_id = None
+    rk_slug = None
+    if args.resume_kernel:
+        rk = args.resume_kernel.strip().strip('"').strip("'")
+        if "/" in rk:
+            rk_user, rk_slug = rk.split("/", 1)
+        else:
+            rk_user = kaggle_user
+            rk_slug = rk
+        rk_user = rk_user.strip().strip('"').strip("'")
+        rk_slug = rk_slug.strip().strip('"').strip("'")
+        # Resolve username alias (e.g. tam11 -> sanjivinsmoker)
+        rk_user_real = alogpu_map.get(rk_user.lower(), rk_user)
+        rk_id = f"{rk_user_real}/{rk_slug}"
+        kernel_sources.append(rk_id)
+
+        # Avoid circular self-dependency if pushing to same account & slug
+        if f"{kaggle_user}/{kernel_slug}" == rk_id:
+            kernel_slug = f"{kernel_slug}-resume"
+            exp_name = f"{exp_name}_resume"
+
+        # Default checkpoint container path if not explicitly provided
+        if not args.resume_ckpt:
+            args.resume_ckpt = f"/kaggle/input/{rk_slug}"
+
+    if args.resume_ckpt:
+        args.resume_ckpt = args.resume_ckpt.strip().strip('"').strip("'")
 
     # runner command line (executed inside the kernel after unpacking)
     runner_args = [
@@ -360,13 +480,13 @@ sys.exit(process.returncode)
         "code_file": "run_script.py",
         "language": "python",
         "kernel_type": "script",
-        "is_private": "true",
+        "is_private": "false" if args.public else "true",
         "enable_gpu": "true",
         "enable_tpu": "false",
         "enable_internet": "true",
         "dataset_sources": dataset_list,
         "competition_sources": [],
-        "kernel_sources": [],
+        "kernel_sources": kernel_sources,
     }
     with open(staging_dir / "kernel-metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -377,6 +497,10 @@ sys.exit(process.returncode)
     print(f"Active Account:  {kaggle_user}")
     print(f"Kernel ID:       {kaggle_user}/{kernel_slug}")
     print(f"Experiment:      {exp_name}")
+    print(f"Visibility:      {'PUBLIC (accessible by all Kaggle accounts)' if args.public else 'PRIVATE'}")
+    if rk_id:
+        print(f"Resume Kernel:   {rk_id} (mounted to /kaggle/input/{rk_slug})")
+        print(f"Resume Ckpt:     {args.resume_ckpt}")
     print(f"Baseline:        {args.baseline.upper()} (informational — BaCon trainer always used)")
     print(f"Dataset:         {dataset_name.upper()} (imb={imb_ratio if imb_ratio is not None else 'natural'})")
     print(f"Config Ablation: {args.config}  (modal launch() mapping)")
@@ -434,9 +558,13 @@ sys.exit(process.returncode)
         print(f"  Status : kaggle kernels status {kaggle_user}/{kernel_slug}")
         print(f"  Results: kaggle kernels output {kaggle_user}/{kernel_slug} -p <dir>")
         print(f"           -> outputs/experiments/{exp_name}/ (log, final_report, checkpoints)")
-        print("  Resume : attach the finished kernel's output as a dataset, then")
-        print("           --resume-ckpt /kaggle/input/<dataset>/outputs/experiments/")
-        print(f"                  {exp_name}/checkpoints/model_best.pt")
+        if args.public:
+            print(f"  Public : https://www.kaggle.com/code/{kaggle_user}/{kernel_slug}")
+            print("  Chaining: To continue on another Kaggle account, run:")
+            print(f"            python kaggle_push.py --baseline {args.baseline} --dataset-name {args.dataset_name} --config {args.config} --imb-ratio {imb_ratio if imb_ratio is not None else 20} --resume-kernel {kaggle_user}/{kernel_slug} --public")
+        else:
+            print(f"  Visibility: PRIVATE (tam{kaggle_user[-2:] if len(kaggle_user)>=2 else ''})")
+            print("  Note      : To chain runs to another Kaggle account, add --public or switch to Public in Kaggle Settings.")
         print("=" * 65)
     else:
         print("\n" + "=" * 65)

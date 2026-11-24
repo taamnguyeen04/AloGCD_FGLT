@@ -5,6 +5,10 @@ import torch
 def get_dataset_targets(dataset):
     if dataset is None:
         return []
+    # ProtoTail v2 holdout wraps labeled subsets in torch Subset.
+    if isinstance(dataset, torch.utils.data.Subset):
+        parent = get_dataset_targets(dataset.dataset)
+        return [int(parent[int(i)]) for i in dataset.indices]
     if hasattr(dataset, 'targets'):
         return np.asarray(dataset.targets, dtype=int).tolist()
     if hasattr(dataset, 'labels'):

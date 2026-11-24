@@ -182,12 +182,22 @@ def ensure_offline_checkpoint(
     if destination.is_file() and destination.stat().st_size > 0:
         return destination
 
+    # Env overrides — PHẢI khớp biến thể (dinov2_vitb14 != dinov2_vitb14_reg).
+    # Lỗi cũ: env trỏ file reg4 (có register_tokens) nhưng vẫn được copy vào
+    # cache dưới tên non-reg -> hub load strict=True nổ "Unexpected key".
     source: Path | None = None
     for var in _WEIGHTS_ENV_VARS:
         env_val = os.environ.get(var)
         if env_val and Path(env_val).is_file():
-            source = Path(env_val)
-            break
+            if _compatible_weights_file(Path(env_val).name, name):
+                source = Path(env_val)
+                break
+            print(
+                f"[DINO Backbone Loader] Ignoring {var}={env_val} "
+                f"(variant mismatch for {name!r}: file is a "
+                f"{'reg' if '_reg' in Path(env_val).stem else 'non-reg'} checkpoint).",
+                flush=True,
+            )
 
     if source is None and repo_dir is not None:
         for candidate in (

@@ -132,6 +132,52 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
     from util.cluster_and_log_utils import set_args_mmf
     set_args_mmf(args, train_loader)
 
+    # ---- ProtoTail v2 effective flags (v1 remains the default) ----
+    pt_master = bool(getattr(args, 'prototail_v2', False))
+    pt_any = pt_master or any(bool(getattr(args, k, False)) for k in (
+        'pt_ledger', 'pt_class_norm', 'pt_sample_cred', 'pt_selection_v2',
+        'pt_holdout', 'pt_fdr', 'pt_novel_purity'))
+    pt_ledger_on = pt_master or bool(getattr(args, 'pt_ledger', False)) \
+        or bool(getattr(args, 'pt_class_norm', False)) \
+        or bool(getattr(args, 'pt_sample_cred', False)) \
+        or bool(getattr(args, 'pt_selection_v2', False))
+    pt_class_norm = pt_master or bool(getattr(args, 'pt_class_norm', False))
+    pt_sample_cred = pt_master or bool(getattr(args, 'pt_sample_cred', False))
+    pt_selection = pt_master or bool(getattr(args, 'pt_selection_v2', False))
+    pt_fdr = ((pt_master and not bool(getattr(args, 'pt_no_fdr', False)))
+              or bool(getattr(args, 'pt_fdr', False)))
+    pt_purity = ((pt_master and not bool(getattr(args, 'pt_no_novel_purity', False)))
+                 or bool(getattr(args, 'pt_novel_purity', False)))
+    pt_split_guard = pt_master and not bool(getattr(args, 'pt_no_split_guard', False))
+    pt_merge_guard = pt_master and not bool(getattr(args, 'pt_no_merge_guard', False))
+    _pt_sd_arg = getattr(args, 'pt_self_distill', None)
+    pt_self_distill = (float(_pt_sd_arg) if _pt_sd_arg is not None
+                       else (0.5 if pt_master else 0.0))
+    if pt_any and not getattr(args, 'use_parts', False):
+        args.logger.warning('[PT-v2] Flags requested but --use-parts is OFF; '
+                            'ProtoTail v2 needs the latent part branch. Disabling v2.')
+        pt_any = pt_master = pt_ledger_on = pt_class_norm = pt_sample_cred = False
+        pt_selection = pt_fdr = pt_purity = False
+        pt_self_distill = 0.0
+    args._pt_master = pt_master
+    args._pt_ledger_on = pt_ledger_on
+    args._pt_class_norm = pt_class_norm
+    args._pt_sample_cred = pt_sample_cred
+    args._pt_selection_v2 = pt_selection
+    args._pt_fdr = pt_fdr
+    args._pt_novel_purity = pt_purity
+    args._pt_self_distill = pt_self_distill
+    args._pt_split_guard = pt_split_guard
+    args._pt_merge_guard = pt_merge_guard
+    args._pt_ledger_ref = None
+    if pt_any:
+        args.logger.info(
+            '[PT-v2] ACTIVE: ledger=%s class_norm=%s sample_cred=%s selection=%s '
+            'holdout=%s fdr=%s novel_purity=%s self_distill=%.2f'
+            % (pt_ledger_on, pt_class_norm, pt_sample_cred, pt_selection,
+               bool(getattr(args, '_pt_holdout_size', 0)),
+               pt_fdr, pt_purity, pt_self_distill))
+
     save_path = args.model_dir
     if not os.path.exists(save_path):
         os.makedirs(save_path)
@@ -254,22 +300,44 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         C = args.num_classes
 
         part_module = LatentPartModule(dim=d, num_slots=M).to(device)
-        part_bank = PartPrototypeBank(num_classes=C, num_slots=M, dim=d).to(device)
-
-        # part queries + cl late blocks learnable; gate LR riêng; prototypes EMA-only
-        nn.init.constant_(part_bank.gate_logits, -1.0)  # a≈0.27, để fused CE mở dần thay vì sập
+        if pt_ledger_on:
+            from model.prototail_v2 import EvidenceLedger
+            part_bank = EvidenceLedger(
+                num_classes=C, num_slots=M, dim=d,
+                decay=float(getattr(args, 'pt_decay', 0.5)),
+                history_epochs=int(getattr(args, 'pt_history_epochs', 3)),
+                shrink_k=float(getattr(args, 'pt_shrink_k', 10.0)),
+                shrink_k_mode=str(getattr(args, 'pt_shrink_k_mode', 'fixed')),
+                num_known=int(getattr(args, 'num_labeled_classes', 0)) or C,
+            ).to(device)
+            part_bank.set_support_counts(getattr(args, 'pt_support_counts', {}))
+            args._pt_ledger_ref = part_bank
+            args.logger.info(
+                f'[PT-v2] EvidenceLedger: decay={part_bank.decay}, '
+                f'E={part_bank.history_epochs}, k={float(part_bank.shrink_k):.1f} '
+                f'({part_bank.shrink_k_mode}), M={M}, C={C}')
+        else:
+            part_bank = PartPrototypeBank(num_classes=C, num_slots=M, dim=d).to(device)
+            # part queries + cl late blocks learnable; gate LR riêng; prototypes EMA-only
+            nn.init.constant_(part_bank.gate_logits, -1.0)  # a≈0.27, để fused CE mở dần thay vì sập
         optimizer_part = SGD(part_module.parameters(), lr=0.05, momentum=0.9, weight_decay=1e-4)
-        optimizer_gate = SGD([part_bank.gate_logits], lr=0.01, momentum=0.9)
-        # Cho part loss update trực tiếp backbone nó đang đứng (fix dead-gradient)
-        from model.backbone import is_late_block_param
-        cl_late_params = [p for n, p in cl_backbone.named_parameters()
-                          if (is_late_block_param(n, 11) or 'norm' in n) and p.requires_grad]
-        if len(cl_late_params) > 0:
-            optimizer_part.add_param_group({'params': cl_late_params, 'lr': 0.01})
+        if not pt_ledger_on:
+            optimizer_gate = SGD([part_bank.gate_logits], lr=0.01, momentum=0.9)
+        # FIX double-update (2026-11-17): KHÔNG đưa cl late blocks (block 11 +
+        # final norm) vào optimizer_part. Chúng đã nằm trong optimizer_cl
+        # (LR args.lr) và được step MỘT lần/batch với grad tích luỹ từ cả
+        # loss_ce (fused CE) lẫn loss_cl (zero_grad trước backward loss_ce,
+        # backward loss_cl ngay sau rồi step — xem vòng lặp train). Bản cũ
+        # add_param_group({'params': cl_late_params, 'lr': 0.01}) khiến cùng
+        # tham số bị step 2 lần/batch với lr + momentum buffer riêng — mâu
+        # thuẫn với chú thích "step một lần" và làm sai động học block cuối
+        # backbone ở mọi config --use-parts.
         scheduler_part = lr_scheduler.CosineAnnealingLR(
             optimizer_part, T_max=args.epochs, eta_min=0.05 * 1e-3)
-        scheduler_gate = lr_scheduler.CosineAnnealingLR(
-            optimizer_gate, T_max=args.epochs, eta_min=0.01 * 1e-3)
+        scheduler_gate = None
+        if optimizer_gate is not None:
+            scheduler_gate = lr_scheduler.CosineAnnealingLR(
+                optimizer_gate, T_max=args.epochs, eta_min=0.01 * 1e-3)
 
         # MVP default: spatial OFF (harmful: Row4_NoSpatial 53.62 > Row2 52.87).
         # Muốn bật lại phải opt-in rõ ràng: --use-spatial-loss (và không truyền --ablate-spatial-loss).
@@ -286,12 +354,18 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                          f'adaptive_cap={not args.ablate_adaptive_capacity}, '
                          f'concat_eval={not args.ablate_concat_eval}')
 
+    pt_ledger = args._pt_ledger_ref if pt_ledger_on else None
 
     # Pseudo labeling state (Fine-Grained GCD)
-    if args.enable_pseudo_labeling:
+    if args.enable_pseudo_labeling or pt_selection:
         pseudo_iteration = 0
         pseudo_samples_added = 0
         used_pseudo_uq_idxs = set()   # uq_idxs already promoted to labeled, avoid duplicates
+        # FIX EMA contamination: uq đã promote có mask_lab=True nhưng label là
+        # DỰ ĐOÁN (audit thật: 25-50%/iter là novel swallowed) — loại khỏi
+        # known-EMA của part_bank (vẫn giữ trong sup CE/fused CE - mục đích
+        # promote). Opt-out: --part-ema-include-pseudo.
+        args._promoted_uq_idxs = set()
         args.pseudo_events = []       # one entry per pseudo update (bias evidence)
         # Ground-truth maps used ONLY for diagnostics (contamination audit),
         # never fed back into training.
@@ -301,6 +375,9 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
         labeled_class_counts = dict(orig_labeled_counts)
         pseudo_added_per_class = {}
         args.logger.info("\n[PSEUDO LABELING] Enabled - Mode {mode}".format(mode=args.pseudo_mode))
+        if getattr(args, 'use_parts', False):
+            args.logger.info("[EMA-GUARD] known-bank EXCLUDES promoted pseudo "
+                             "(--part-ema-include-pseudo để tắt guard, hành vi cũ).")
         args.logger.info("[PSEUDO LABELING] Original labeled distribution: {}".format(
             dict(sorted(orig_labeled_counts.items()))))
         # Novel-door (D2) state: cong tac --enable-novel-pseudo. Tat = known-only nhu cu.
@@ -460,6 +537,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
     for epoch in range(start_epoch, args.epochs):
         args.current_epoch = epoch
+        if pt_ledger is not None:
+            pt_ledger.begin_epoch(epoch)
         # A1: momentum theo lich cosine (chi dung khi teacher bat)
         args._teacher_m = _teacher_momentum(epoch, args.epochs, teacher_m0)
         loss_record_ce = AverageMeter()
@@ -547,6 +626,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             if part_module is not None:
                 # Forward: patch_tokens -> part features (B*n_views, M, d)
                 r_norm, A = part_module(cl_patch_tokens)
+                r_norm = r_norm.float()
 
                 # 1. Spatial diversity loss on attention maps
                 if not args.ablate_spatial_loss and epoch >= 50:
@@ -557,51 +637,88 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
 
                 # 2. Fused CE loss on labeled subset only (using view 0)
                 if not args.ablate_fused_ce:
-                    B_total = class_labels.shape[0]
-                    B_half = B_total // args.n_views
+                    # class_labels has one row per sample; each of the
+                    # n_views chunks of student_out / r_norm has B rows.
+                    B_half = class_labels.shape[0]
                     r_norm_v0 = r_norm[:B_half]           # (B, M, d) view 0
                     mask_lab_v0 = mask_lab[:B_half]
 
+                    g_global_v0 = student_out[:B_half]
+                    fused_labels = class_labels[:B_half][mask_lab_v0]
                     if mask_lab_v0.sum() > 0:
-                        g_part, _, a = part_bank(r_norm_v0)
+                        if pt_ledger is not None:
+                            # v2: raw prototypes for logits, class-wise
+                            # non-member normalisation, sample-level lambda_i.
+                            g_fused_v0, ell_v0, lam_v0 = pt_ledger.fused_logits(
+                                g_global_v0, r_norm_v0,
+                                lambda_part=args.part_lambda,
+                                topk=int(getattr(args, 'pt_topk', 5)),
+                                use_raw=True,
+                            )
+                            _scaled = g_fused_v0[mask_lab_v0] / args.tau_c
+                            if getattr(args, 'use_logit_adjust', False) and \
+                                    getattr(args, 'est_adjustment', None) is not None:
+                                _scaled = _scaled - args.est_adjustment
+                            loss_fused = nn.functional.cross_entropy(_scaled, fused_labels)
+                            pstr += (f'pt_fused: {loss_fused.item():.2f} '
+                                     f'lam_i: {lam_v0.mean().item():.2f} ')
+                            args._pt_last_lambda_mean = float(lam_v0.mean().item())
+                        else:
+                            g_part, _, a = part_bank(r_norm_v0)
+                            loss_fused, g_fused = compute_fused_ce_loss(
+                                g_global_v0[mask_lab_v0],
+                                g_part[mask_lab_v0],
+                                fused_labels,
+                                lambda_part=args.part_lambda,
+                                tau=args.tau_c,
+                                est_adjustment=(getattr(args, 'est_adjustment', None)
+                                                if getattr(args, 'use_logit_adjust', False)
+                                                else None),
+                            )
+                            gate_max = a.max(dim=-1)[0].mean().item()
+                            pstr += f'gate_max: {gate_max:.2f} '
 
-                        # Fused with global logits (normalized to same scale)
-                        g_global_v0 = student_out[:B_half]
-                        fused_labels = class_labels[:B_half][mask_lab_v0]
+                            # Gate regularization
+                            loss_gate, _, _ = compute_gate_reg_loss(a)
+                            loss_ce = loss_ce + 0.05 * loss_gate
+                            comp_meters['gate_reg'].update(loss_gate.item(), class_labels.size(0))
 
-                        loss_fused, g_fused = compute_fused_ce_loss(
-                            g_global_v0[mask_lab_v0],
-                            g_part[mask_lab_v0],
-                            fused_labels,
-                            lambda_part=args.part_lambda,
-                            tau=args.tau_c,
-                            est_adjustment=(getattr(args, 'est_adjustment', None)
-                                            if getattr(args, 'use_logit_adjust', False)
-                                            else None),
-                        )
+                            # Distribution-adaptive gating
+                            if not args.ablate_adaptive_capacity and est_count is not None:
+                                pi_hat = est_count.detach().clone().float().to(device)
+                                M_target = compute_target_capacity(pi_hat, args.num_slots)
+                                loss_dist = compute_dist_adaptive_gate_loss(a, M_target)
+                                loss_ce = loss_ce + 0.05 * loss_dist
+                                pstr += f'dist_gate: {loss_dist.item():.2f} '
+                                comp_meters['dist_gate'].update(loss_dist.item(), class_labels.size(0))
                         loss_ce = loss_ce + loss_fused
-                        pstr += f'fused_ce: {loss_fused.item():.2f} '
                         comp_meters['fused'].update(loss_fused.item(), class_labels.size(0))
-                        
-                        gate_max = a.max(dim=-1)[0].mean().item()
-                        pstr += f'gate_max: {gate_max:.2f} '
 
-                        # Gate regularization
-                        loss_gate, _, _ = compute_gate_reg_loss(a)
-                        loss_ce = loss_ce + 0.05 * loss_gate
-                        comp_meters['gate_reg'].update(loss_gate.item(), class_labels.size(0))
-
-                        # Distribution-adaptive gating
-                        if not args.ablate_adaptive_capacity and est_count is not None:
-                            pi_hat = est_count.detach().clone().float().to(device)
-                            M_target = compute_target_capacity(pi_hat, args.num_slots)
-                            loss_dist = compute_dist_adaptive_gate_loss(a, M_target)
-                            loss_ce = loss_ce + 0.05 * loss_dist
-                            pstr += f'dist_gate: {loss_dist.item():.2f} '
-                            comp_meters['dist_gate'].update(loss_dist.item(), class_labels.size(0))
+                    # v2 optional self-distillation on unlabeled fused logits.
+                    if (pt_ledger is not None and pt_self_distill > 0
+                            and student_out.shape[0] >= 2 * B_half
+                            and (~mask_lab[:B_half]).sum() > 0):
+                        _r_v1 = r_norm[B_half:]
+                        _g_v1 = student_out[B_half:]
+                        _g_fused_v0, _, _ = pt_ledger.fused_logits(
+                            g_global_v0, r_norm_v0,
+                            lambda_part=args.part_lambda,
+                            topk=int(getattr(args, 'pt_topk', 5)), use_raw=True)
+                        _g_fused_v1, _, _ = pt_ledger.fused_logits(
+                            _g_v1, _r_v1,
+                            lambda_part=args.part_lambda,
+                            topk=int(getattr(args, 'pt_topk', 5)), use_raw=True)
+                        _unl = ~mask_lab[:B_half]
+                        if _unl.sum() > 0:
+                            _teacher = torch.softmax(_g_fused_v0[_unl].detach() / 0.05, dim=-1)
+                            _student = torch.log_softmax(_g_fused_v1[_unl] / 0.1, dim=-1)
+                            loss_sd = -( _teacher * _student).sum(dim=-1).mean()
+                            loss_ce = loss_ce + pt_self_distill * loss_sd
+                            pstr += f'pt_sd: {loss_sd.item():.2f} '
 
                 optimizer_part.zero_grad()
-                optimizer_gate.zero_grad()
+                if optimizer_gate is not None:
+                    optimizer_gate.zero_grad()
                 optimizer_ce.zero_grad()
                 optimizer_cl.zero_grad()
                 scaler.scale(loss_ce).backward(retain_graph=True)
@@ -616,18 +733,55 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 if teacher_ce is not None:
                     _ema_update_teacher(teacher_ce, student_ce, args._teacher_m)
 
-            # --- EMA prototype update (after warmup) ---
-            ema_start = min(30, args.epochs - 1)
-            if part_module is not None and epoch >= ema_start:
+            # --- Prototype memory update ---
+            # v2 ledger: observe every epoch, no hard warmup/window.
+            if pt_ledger is not None:
                 with torch.no_grad():
-                    B_half = class_labels.shape[0] // args.n_views
+                    B_half = class_labels.shape[0]
+                    r_v0 = r_norm[:B_half].detach()
+                    g0 = student_out[:B_half].detach()
+                    g1 = (student_out[B_half:2 * B_half].detach()
+                          if student_out.shape[0] >= 2 * B_half else g0)
+                    mask_v0 = mask_lab[:B_half]
+                    pred0 = g0.argmax(dim=-1)
+                    pred1 = g1.argmax(dim=-1)
+                    probs0 = torch.softmax(g0, dim=-1)
+                    part_g, _, _ = pt_ledger(r_v0, use_shrunk=True)
+                    pred_part = part_g.argmax(dim=-1)
+                    pt_ledger.observe_batch(
+                        r_v0, class_labels[:B_half], mask_v0, uq_idxs[:B_half],
+                        pred_global=pred0, pred_global_v1=pred1,
+                        pred_part=pred_part, probs_global=probs0)
+                    if (~mask_v0).sum() > 0:
+                        purity = (pred0[~mask_v0] == class_labels[:B_half][~mask_v0]).float().mean()
+                        ema_purity_record.update(purity.item(), int((~mask_v0).sum().item()))
+
+            # --- EMA prototype update (v1, after warmup) ---
+            ema_start = min(30, args.epochs - 1)
+            if pt_ledger is None and part_module is not None and epoch >= ema_start:
+                with torch.no_grad():
+                    B_half = class_labels.shape[0]
                     r_v0 = r_norm[:B_half].detach()
                     lab_v0 = class_labels[:B_half]
                     mask_v0 = mask_lab[:B_half]
 
-                    # Known class EMA
+                    # Known class EMA — chỉ từ sample labeled THỰC.
+                    # FIX EMA contamination: pseudo đã promote cũng có
+                    # mask_lab=True nhưng label là DỰ ĐOÁN (audit thật:
+                    # 25-50%/iter là novel swallowed). Loại khỏi EMA 0.99
+                    # để known prototype không bị nh_labels sai kéo lệch;
+                    # pseudo vẫn ở lại sup CE/fused CE (mục đích promote).
                     if mask_v0.sum() > 0:
-                        part_bank.update_ema(r_v0[mask_v0], lab_v0[mask_v0])
+                        _ema_mask = mask_v0
+                        if not getattr(args, 'part_ema_include_pseudo', False):
+                            _prom = getattr(args, '_promoted_uq_idxs', None)
+                            if _prom:
+                                _uq_v0 = [int(u) for u in uq_idxs[:B_half]]
+                                _keep = torch.tensor([u not in _prom for u in _uq_v0],
+                                                     device=mask_v0.device)
+                                _ema_mask = mask_v0 & _keep
+                        if _ema_mask.sum() > 0:
+                            part_bank.update_ema(r_v0[_ema_mask], lab_v0[_ema_mask])
 
                     # Novel class EMA with confidence filtering
                     if not mask_v0.all() and not args.ablate_confidence:
@@ -678,7 +832,8 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                 scaler.step(optimizer_ce)
                 scaler.step(optimizer_cl)
                 scaler.step(optimizer_part)
-                scaler.step(optimizer_gate)
+                if optimizer_gate is not None:
+                    scaler.step(optimizer_gate)
                 scaler.update()
                 if teacher_ce is not None:
                     _ema_update_teacher(teacher_ce, student_ce, args._teacher_m)
@@ -702,6 +857,16 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     f'loss_cl={loss_cl.item():.3f} '
                     f'lr_ce={optimizer_ce.param_groups[0]["lr"]:.5f} '
                     f'lr_cl={optimizer_cl.param_groups[0]["lr"]:.5f}')
+
+        if pt_ledger is not None:
+            _pt_info = pt_ledger.end_epoch(epoch)
+            args._pt_last_epoch_info = _pt_info
+            args.logger.info(
+                f"[PT-v2] epoch {epoch}: Z_mean={_pt_info['Z_mean']:.3f} "
+                f"Z_known={_pt_info['Z_known_mean']:.3f} "
+                f"n_eff={_pt_info['n_eff_mean']:.1f} "
+                f"k={_pt_info['shrink_k']:.1f} "
+                f"rho_bar={_pt_info['history_bar']:.2f}")
 
         _ep_time = _time.time() - _ep_t0
         _elapsed_min = (_time.time() - args._train_t0) / 60.0
@@ -877,7 +1042,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
             student_cl.train()
         
         # Pseudo Labeling Update Logic (Fine-Grained GCD)
-        if args.enable_pseudo_labeling and args.pseudo_update_freq > 0:
+        if args.enable_pseudo_labeling and args.pseudo_update_freq > 0 and not pt_selection:
             warmup = getattr(args, 'pseudo_warmup_epoch', 30)
             should_update = (epoch >= warmup) and ((epoch - warmup) % args.pseudo_update_freq == 0)
             
@@ -964,6 +1129,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                         max_label=args.num_labeled_classes if args.pseudo_mode == 2 else None
                     )
                 used_pseudo_uq_idxs |= newly_used
+                args._promoted_uq_idxs |= newly_used
 
                 if args.pseudo_mode == 0:
                     args.logger.info(f"[MODE 0] Known door OFF — skipping known collection.")
@@ -991,6 +1157,7 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                             train_loader, args,
                             used_uq_idxs=used_pseudo_uq_idxs)
                         used_pseudo_uq_idxs |= {s['uq_idx'] for s in new_novel_pseudo}
+                        args._promoted_uq_idxs |= {s['uq_idx'] for s in new_novel_pseudo}
                     else:
                         args.logger.info(f"[NOVEL-PSEUDO] Skipped (epoch {epoch}: "
                                          f"warmup={n_warm} freq={n_freq} "
@@ -1039,6 +1206,107 @@ def train_dual(ce_backbone, ce_head, cl_backbone, cl_head, train_loader, test_lo
                     args.logger.info(f"Total pseudo samples added: {pseudo_samples_added}")
                     args.logger.info("="*60 + "\n")
         
+        # ProtoTail v2 selection: schedule + holdout/LCB/FDR gates.
+        # This replaces the v1 known/novel doors above when enabled.
+        if pt_selection and pt_ledger is not None and part_module is not None:
+            from model.prototail_v2 import selection_schedule
+            _run_v2, _bucket = selection_schedule(
+                epoch, args.epochs,
+                start=float(getattr(args, 'pt_sel_start', 0.25)),
+                end=float(getattr(args, 'pt_sel_end', 0.75)),
+                every=float(getattr(args, 'pt_sel_every', 0.05)),
+                last_bucket=getattr(args, '_pt_last_sel_bucket', None),
+            )
+            if _run_v2:
+                args._pt_last_sel_bucket = _bucket
+                pseudo_iteration += 1
+                args.logger.info("\n" + "=" * 60)
+                args.logger.info(
+                    f"[PT-v2 SELECTION] round {pseudo_iteration} at epoch {epoch} "
+                    f"(progress bucket {_bucket})")
+                args.logger.info("=" * 60)
+                unlab_loader = DataLoader(
+                    train_loader.dataset.unlabelled_dataset,
+                    batch_size=256, shuffle=False, num_workers=0,
+                )
+                try:
+                    new_pseudo, _pt_sel_stats = collect_prototail_v2_pseudo(
+                        student_ce, cl_backbone, part_module, pt_ledger,
+                        unlab_loader, args,
+                        used_uq_idxs=used_pseudo_uq_idxs,
+                    )
+                except Exception as _pt_e:
+                    args.logger.exception(f'[PT-v2] selection failed: {_pt_e}')
+                    new_pseudo, _pt_sel_stats = [], {'status': 'error'}
+                args._pt_last_selection_stats = _pt_sel_stats
+                args.logger.info(
+                    '[PT-v2] pass: unlabeled={n_unlabeled} candidates={n_candidates} '
+                    'holdout={n_holdout} selected={n_selected}'.format(
+                        n_unlabeled=_pt_sel_stats.get('n_unlabeled', 0),
+                        n_candidates=_pt_sel_stats.get('n_candidates', 0),
+                        n_holdout=_pt_sel_stats.get('n_holdout', 0),
+                        n_selected=_pt_sel_stats.get('n_selected', 0),
+                    ))
+                if new_pseudo:
+                    newly_used = {int(s['uq_idx']) for s in new_pseudo}
+                    used_pseudo_uq_idxs |= newly_used
+                    args._promoted_uq_idxs |= newly_used
+                    pt_ledger.mark_promoted(newly_used)
+                    pseudo_samples_added += len(new_pseudo)
+                    for s in new_pseudo:
+                        _lab = int(s['label'])
+                        pseudo_added_per_class[_lab] = pseudo_added_per_class.get(_lab, 0) + 1
+                    audit = audit_pseudo_samples(
+                        new_pseudo, args.uq2true,
+                        num_labeled=args.num_labeled_classes)
+                    log_pseudo_audit(audit, pseudo_iteration, None, args)
+                    train_loader = update_train_loader(
+                        train_loader, train_loader.dataset, new_pseudo)
+                    count_pseudo_into(labeled_class_counts, new_pseudo)
+                    log_labeled_distribution(
+                        orig_labeled_counts, labeled_class_counts,
+                        pseudo_added_per_class, args)
+                    # Keep only JSON-friendly summary fields for the chart.
+                    _safe_known = [
+                        {'class': int(x['class']), 'n': int(x['n']),
+                         'budget': int(x['budget']),
+                         'lcb': float(x.get('lcb') or 0.0),
+                         'pvalue': float(x.get('pvalue') or 1.0)}
+                        for x in _pt_sel_stats.get('known', [])
+                    ]
+                    _safe_novel = [
+                        {'dim': int(x['dim']), 'n': int(x['n']),
+                         'budget': int(x['budget']),
+                         'lcb': float(x.get('lcb') or 0.0),
+                         'pvalue': float(x.get('pvalue') or 1.0),
+                         'identity': float(x.get('identity') or 0.0)}
+                        for x in _pt_sel_stats.get('novel', [])
+                    ]
+                    args.pseudo_events.append({
+                        'iteration': pseudo_iteration,
+                        'epoch': epoch,
+                        'n_selected': len(new_pseudo),
+                        **audit,
+                        'novel_gate': None,
+                        'pt_v2': {
+                            'n_candidates': int(_pt_sel_stats.get('n_candidates', 0)),
+                            'n_holdout': int(_pt_sel_stats.get('n_holdout', 0)),
+                            'known_p_bar': float(_pt_sel_stats.get('known_p_bar', 0.0)),
+                            'known_m': float(_pt_sel_stats.get('known_m', 0.0)),
+                            'novel_q_bar': float(_pt_sel_stats.get('novel_q_bar', 0.0)),
+                            'known': _safe_known,
+                            'novel': _safe_novel,
+                        },
+                        'pseudo_samples_total': pseudo_samples_added,
+                        **{f'labeled_c{c}': labeled_class_counts.get(c, 0)
+                           for c in sorted(set(orig_labeled_counts) | set(labeled_class_counts))},
+                    })
+                    save_bias_evidence_chart(args.pseudo_events, pseudo_iteration, args)
+                    args.logger.info(f'[PT-v2] Total pseudo samples added: {pseudo_samples_added}')
+                    args.logger.info("=" * 60 + "\n")
+                else:
+                    args.logger.info('[PT-v2] No pseudo samples passed the gates this round.')
+
         # Step schedule
         exp_lr_scheduler_ce.step()
         exp_lr_scheduler_cl.step()
@@ -1645,13 +1913,19 @@ def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_c
     candidates = []   # (confidence, uq_idx, image tensor, pred)
     seen_uq = []
 
+    pos = 0  # vị trí mẫu trong unlabelled_dataset (loader shuffle=False)
     with torch.no_grad():
         for batch in unlabeled_loader:
-            images = batch[0]
+            images_ = batch[0]
             uq_idxs = batch[2]
-            if isinstance(images, (list, tuple)):
-                images = images[0]
-            images = images.to(device)
+            # FIX identical-views: giữ CẢ HAI view. Sample pseudo sẽ train với
+            # 2 augmentations khác nhau như sample thường, không còn [v0, v0.clone()].
+            if isinstance(images_, (list, tuple)) and len(images_) > 1:
+                v0s, v1s = images_[0], images_[1]
+            else:
+                v0s = images_[0] if isinstance(images_, (list, tuple)) else images_
+                v1s = v0s
+            images = v0s.to(device)
 
             with torch.autocast(device_type='cuda', dtype=torch.float16,
                                 enabled=getattr(args, 'fp16', False)):
@@ -1661,7 +1935,7 @@ def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_c
             probs = F.softmax(logits, dim=1)
             confs, preds = probs.max(dim=1)
 
-            for img, pred, conf, uq in zip(images, preds, confs, uq_idxs):
+            for _i, (img, pred, conf, uq) in enumerate(zip(images, preds, confs, uq_idxs)):
                 uq = int(uq)
                 seen_uq.append(uq)
                 if uq in used_uq_idxs:
@@ -1671,12 +1945,15 @@ def collect_pseudo_labels_from_unlabeled(model, unlabeled_loader, mode, target_c
 
                 if mode in (1, 3):
                     if p == target_class:
-                        candidates.append({'image': img.cpu(), 'label': p,
+                        candidates.append({'image': img.cpu(), 'image1': v1s[_i].cpu(),
+                                           'pos': pos + _i, 'label': p,
                                            'confidence': c, 'uq_idx': uq})
                 elif mode == 2:
                     if c >= threshold and (max_label is None or p < max_label):
-                        candidates.append({'image': img.cpu(), 'label': p,
+                        candidates.append({'image': img.cpu(), 'image1': v1s[_i].cpu(),
+                                           'pos': pos + _i, 'label': p,
                                            'confidence': c, 'uq_idx': uq})
+            pos += len(uq_idxs)
 
     # Mode 1/3: keep top_ratio fraction by confidence (user request: e.g. best 80%)
     if mode in (1, 3):
@@ -1767,11 +2044,19 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
         cl_backbone.eval()
 
         # ---- 1. Single fused pass: CL feats + CE logits ----
-        U_feats, U_pred, U_conf, U_uq, U_imgs = [], [], [], [], []
+        U_feats, U_pred, U_conf, U_uq, U_imgs, U_imgs1, U_pos = [], [], [], [], [], [], []
+        pos = 0  # vị trí mẫu trong unlabelled_dataset (loader shuffle=False)
         with torch.no_grad():
             for batch in unlab_loader:
-                images = _first_view(batch[0]).to(device)
+                images_ = batch[0]
                 uq = batch[2]
+                # FIX identical-views: giữ cả 2 view (xem create_pseudo_dataset).
+                if isinstance(images_, (list, tuple)) and len(images_) > 1:
+                    v0s, v1s = images_[0], images_[1]
+                else:
+                    v0s = _first_view(images_)
+                    v1s = v0s
+                images = v0s.to(device)
                 with torch.autocast(device_type='cuda', dtype=torch.float16,
                                     enabled=getattr(args, 'fp16', False)):
                     cf_raw = cl_backbone(images)
@@ -1785,7 +2070,10 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
                 U_pred.append(pred.cpu())
                 U_conf.append(conf.cpu())
                 U_uq.extend([int(x) for x in uq])
-                U_imgs.extend([im.cpu() for im in _first_view(batch[0])])
+                U_imgs.extend([im.cpu() for im in v0s])
+                U_imgs1.extend([im.cpu() for im in v1s])
+                U_pos.extend(range(pos, pos + len(uq)))
+                pos += len(uq)
         U_feats = torch.cat(U_feats).numpy()
         U_pred = torch.cat(U_pred).numpy().astype(int)
         U_conf = torch.cat(U_conf).numpy()
@@ -1908,7 +2196,8 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
                     continue
                 used_uq.add(uq)
                 new_member_uqs.add(uq)
-                selected.append({'image': U_imgs[idx], 'label': top_dim,
+                selected.append({'image': U_imgs[idx], 'image1': U_imgs1[idx],
+                                 'pos': U_pos[idx], 'label': top_dim,
                                  'confidence': float(U_conf[idx]), 'uq_idx': uq})
                 kept += 1
             dim_members[top_dim] = new_member_uqs
@@ -1944,28 +2233,388 @@ def collect_novel_pseudo_from_unlabeled(student_ce, cl_backbone, unlab_loader,
         return []
 
 
-def create_pseudo_dataset(pseudo_samples):
-    """Create dataset from pseudo samples."""
+def collect_prototail_v2_pseudo(
+    student_ce,
+    cl_backbone,
+    part_module,
+    ledger,
+    unlab_loader,
+    args,
+    used_uq_idxs=None,
+):
+    """Collect known + novel pseudo labels with the ProtoTail v2 gates.
+
+    This is deliberately a single forward pass over D_U.  Holdout samples are
+    part of D_U and their true labels are used only to calibrate/audit the
+    gates; they are never promoted.  Returns ``(selected, stats)``.
+    """
     import torch
-    
+    import torch.nn.functional as F
+    import numpy as np
+
+    from model.prototail_v2 import (
+        build_known_records, build_novel_record, fit_beta_prior, gate_records,
+        inverse_credibility_budget, novel_purity_guard, select_by_budget,
+        split_merge_guard,
+    )
+
+    args.logger.info('[PT-v2] Selection pass: collecting unlabeled predictions...')
+    device = _infer_device(student_ce)
+    NL = int(args.num_labeled_classes)
+    C = int(args.num_classes)
+    used = set(used_uq_idxs or ())
+    holdout_map = dict(getattr(args, '_pt_holdout_uq_to_label', {}) or {})
+    rho_min = float(getattr(args, 'pt_rho_min', 0.5))
+    conf_min = float(getattr(args, 'pt_conf_min', 0.0))
+
+    student_ce.eval()
+    cl_backbone.eval()
+    part_module.eval()
+
+    U_feat, U_pred0, U_pred1, U_predp, U_conf, U_uq = [], [], [], [], [], []
+    U_img, U_img1, U_pos = [], [], []
+    pos = 0
+    with torch.no_grad():
+        for batch in unlab_loader:
+            images_ = batch[0]
+            uq = batch[2]
+            if isinstance(images_, (list, tuple)) and len(images_) > 1:
+                v0s, v1s = images_[0], images_[1]
+            else:
+                v0s = _first_view(images_)
+                v1s = v0s
+            v0 = v0s.to(device)
+            v1 = v1s.to(device)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=getattr(args, 'fp16', False)):
+                ce_f0 = student_ce[0](v0)
+                logits0 = student_ce[1](F.normalize(ce_f0.float(), dim=-1))
+                ce_f1 = student_ce[0](v1)
+                logits1 = student_ce[1](F.normalize(ce_f1.float(), dim=-1))
+                from model.backbone import forward_backbone_tokens
+                _, patch_tokens, _ = forward_backbone_tokens(cl_backbone, v0)
+                r_norm, _ = part_module(patch_tokens)
+                r_norm = r_norm.float()
+                g_part, _, _ = ledger(r_norm, use_shrunk=True)
+            probs0 = F.softmax(logits0.float(), dim=-1)
+            conf0, pred0 = probs0.max(dim=-1)
+            pred1 = logits1.float().argmax(dim=-1)
+            predp = g_part.argmax(dim=-1)
+            U_feat.append(r_norm.mean(dim=1).float().cpu())
+            U_pred0.append(pred0.cpu())
+            U_pred1.append(pred1.cpu())
+            U_predp.append(predp.cpu())
+            U_conf.append(conf0.cpu())
+            U_uq.extend([int(x) for x in uq])
+            U_img.extend([im.cpu() for im in v0s])
+            U_img1.extend([im.cpu() for im in v1s])
+            U_pos.extend(range(pos, pos + len(uq)))
+            pos += len(uq)
+
+    if not U_uq:
+        return [], {'status': 'empty'}
+    feat = torch.cat(U_feat).numpy().astype(np.float64)
+    pred0 = torch.cat(U_pred0).numpy().astype(int)
+    pred1 = torch.cat(U_pred1).numpy().astype(int)
+    predp = torch.cat(U_predp).numpy().astype(int)
+    conf = torch.cat(U_conf).numpy().astype(np.float64)
+    uq_arr = np.asarray(U_uq, dtype=np.int64)
+    hold_mask = np.asarray([int(u) in holdout_map for u in uq_arr], dtype=bool)
+    hold_true = np.asarray([int(holdout_map.get(int(u), -1)) for u in uq_arr], dtype=np.int64)
+
+    # Stability rho_i from the ledger's recent prediction votes.
+    rho = ledger.stability_for_ids(uq_arr.tolist(), pred0.tolist())
+
+    # Per-class confidence thresholds from holdout (true class c, predicted c).
+    conf_thr = np.full(C, conf_min, dtype=np.float64)
+    q_conf = float(getattr(args, 'pt_conf_quantile', 0.10))
+    for c in range(C):
+        vals = conf[hold_mask & (hold_true == c) & (pred0 == c)]
+        if vals.size >= 3:
+            conf_thr[c] = max(conf_min, float(np.quantile(vals, q_conf)))
+
+    gate_base = (pred0 == pred1) & (pred0 == predp) & \
+        (conf >= conf_thr[np.clip(pred0, 0, C - 1)]) & (rho >= rho_min)
+    candidate_mask = gate_base & (~hold_mask)
+
+    # ---- Known-class calibration records ----
+    known_rates, known_counts, known_recs = [], [], []
+    for c in range(NL):
+        correct, n_cal = build_known_records(pred0, hold_true, gate_base, c)
+        known_recs.append({'class': int(c), 'success': int(correct), 'n': int(n_cal)})
+        if n_cal > 0:
+            known_rates.append(correct / max(1, n_cal))
+            known_counts.append(n_cal)
+    p_bar, m_prior = fit_beta_prior(known_rates, known_counts,
+                                    default_p=0.85, min_m=2.0, max_m=100.0)
+    known_recs = gate_records(
+        known_recs, threshold=float(getattr(args, 'pt_threshold', 0.85)),
+        p_bar=p_bar, m=m_prior,
+        quantile=float(getattr(args, 'pt_alpha_quantile', 0.10)),
+        use_fdr=bool(getattr(args, '_pt_fdr', False)),
+        fdr_q=float(getattr(args, 'pt_fdr_q', 0.10)),
+    )
+
+    # ---- Novel-dimension agreement records ----
+    novel_rates, novel_counts, novel_recs = [], [], []
+    for k in range(NL, C):
+        agree, n_k = build_novel_record(pred0, gate_base, k)
+        novel_recs.append({'dim': int(k), 'success': int(agree), 'n': int(n_k)})
+        if n_k > 0:
+            novel_rates.append(agree / max(1, n_k))
+            novel_counts.append(n_k)
+    q_bar, q_m = fit_beta_prior(novel_rates, novel_counts,
+                                default_p=0.85, min_m=2.0, max_m=100.0)
+    novel_recs = gate_records(
+        novel_recs, threshold=float(getattr(args, 'pt_threshold', 0.85)),
+        p_bar=q_bar, m=q_m,
+        quantile=float(getattr(args, 'pt_alpha_quantile', 0.10)),
+        use_fdr=bool(getattr(args, '_pt_fdr', False)),
+        fdr_q=float(getattr(args, 'pt_fdr_q', 0.10)),
+    )
+
+    b_min = int(getattr(args, 'pt_budget_min', 20))
+    b_max = int(getattr(args, 'pt_budget_max', 500))
+    selected = []
+    selected_known, selected_novel = [], []
+    novel_core_dims = set(getattr(args, '_pt_novel_core_dims', set()) or set())
+
+    def _pack(idxs, label):
+        out = []
+        for idx in idxs:
+            out.append({
+                'image': U_img[idx], 'image1': U_img1[idx], 'pos': int(U_pos[idx]),
+                'label': int(label), 'confidence': float(conf[idx]),
+                'uq_idx': int(uq_arr[idx]),
+            })
+        return out
+
+    # Known classes: every class is considered each round.
+    for rec in known_recs:
+        c = int(rec['class'])
+        if not rec.get('selected', False):
+            continue
+        idxs = np.where(candidate_mask & (pred0 == c))[0]
+        if idxs.size == 0:
+            continue
+        cands = []
+        for idx in idxs:
+            cands.append({'idx': int(idx), 'uq_idx': int(uq_arr[idx]),
+                          'confidence': float(conf[idx])})
+        budget = inverse_credibility_budget(
+            float(ledger.Z[c].item()), budget_min=b_min, budget_max=b_max)
+        picked = select_by_budget(cands, budget, used_uq=used)
+        picked_uqs = {int(x['uq_idx']) for x in picked}
+        used |= picked_uqs
+        picked_idx = [int(x['idx']) for x in picked]
+        selected.extend(_pack(picked_idx, c))
+        selected_known.append({'class': c, 'n': len(picked_idx),
+                               'budget': budget, 'lcb': rec.get('lcb'),
+                               'pvalue': rec.get('pvalue')})
+        # Known cores help the novel merge guard as well.
+        if picked_idx:
+            ledger.add_core_samples([c] * len(picked_idx),
+                                    torch.from_numpy(feat[picked_idx]).float())
+
+    # Novel groups: one group per head output dimension.
+    for rec in novel_recs:
+        k = int(rec['dim'])
+        if not rec.get('selected', False):
+            continue
+        idxs = np.where(candidate_mask & (pred0 == k))[0]
+        if idxs.size == 0:
+            continue
+        # Identity check against the existing promoted core.
+        core = ledger.core_feature(k)
+        group_feat = feat[idxs]
+        centroid = group_feat.mean(axis=0)
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
+        identity_cos = 1.0
+        if core is not None:
+            identity_cos = float(np.dot(centroid, core.detach().cpu().numpy()))
+            if identity_cos < float(getattr(args, 'pt_identity', 0.5)):
+                args.logger.info(f'[PT-v2] novel dim {k}: identity {identity_cos:.3f} '
+                                 f'< {getattr(args, "pt_identity", 0.5)} — skip.')
+                continue
+
+        if bool(getattr(args, '_pt_novel_purity', False)):
+            leak = int(np.sum(hold_mask & (pred0 == k)))
+            pur = novel_purity_guard(leak, int(idxs.size),
+                                     float(getattr(args, 'pt_novel_leak_max', 0.05)))
+            if not pur['pass']:
+                args.logger.info(f'[PT-v2] novel dim {k}: purity leak '
+                                 f'{pur["leak_rate"]:.3f} — skip.')
+                continue
+
+        other_centroids = []
+        for kk in novel_core_dims:
+            cf = ledger.core_feature(int(kk))
+            if cf is not None:
+                other_centroids.append(cf.detach().cpu().numpy())
+        guard = split_merge_guard(
+            group_feat,
+            other_centroids=(np.asarray(other_centroids) if other_centroids else None),
+            split_silhouette=float(getattr(args, 'pt_split_silhouette', 0.25)),
+            merge_cos=float(getattr(args, 'pt_merge_cos', 0.95)),
+        )
+        if bool(getattr(args, '_pt_split_guard', False)) and guard.get('split'):
+            args.logger.info(f'[PT-v2] novel dim {k}: split guard '
+                             f'(sil={guard.get("silhouette"):.2f}) — skip.')
+            continue
+        if bool(getattr(args, '_pt_merge_guard', False)) and guard.get('merge'):
+            args.logger.info(f'[PT-v2] novel dim {k}: merge guard '
+                             f'(cos={guard.get("merge_cos"):.3f}) — skip.')
+            continue
+
+        cands = [{'idx': int(i), 'uq_idx': int(uq_arr[i]),
+                  'confidence': float(conf[i])} for i in idxs]
+        budget = inverse_credibility_budget(
+            float(ledger.Z[k].item()), budget_min=b_min, budget_max=b_max)
+        picked = select_by_budget(cands, budget, used_uq=used)
+        picked_uqs = {int(x['uq_idx']) for x in picked}
+        used |= picked_uqs
+        picked_idx = [int(x['idx']) for x in picked]
+        selected.extend(_pack(picked_idx, k))
+        selected_novel.append({'dim': k, 'n': len(picked_idx), 'budget': budget,
+                               'lcb': rec.get('lcb'), 'pvalue': rec.get('pvalue'),
+                               'identity': identity_cos})
+        if picked_idx:
+            ledger.add_core_samples([k] * len(picked_idx),
+                                    torch.from_numpy(feat[picked_idx]).float())
+            novel_core_dims.add(k)
+    args._pt_novel_core_dims = novel_core_dims
+
+    stats = {
+        'status': 'ok',
+        'n_unlabeled': int(len(uq_arr)),
+        'n_candidates': int(candidate_mask.sum()),
+        'n_holdout': int(hold_mask.sum()),
+        'known_p_bar': float(p_bar), 'known_m': float(m_prior),
+        'novel_q_bar': float(q_bar), 'novel_m': float(q_m),
+        'known': selected_known, 'novel': selected_novel,
+        'n_selected': int(len(selected)),
+    }
+    return selected, stats
+
+
+def _raw_pil_and_transform(ds, pos):
+    """Lấy ảnh GỐC (PIL) + transform (view generator) của dataset gốc theo vị trí.
+
+    Dùng để pseudo sample được re-augment 2 view MỚI mỗi lần lấy (giống sample
+    thường) thay vì dùng lại tensor đã augment. Trả None khi không truy cập
+    được raw -> caller fallback sang cặp 2 view đã lưu lúc promote.
+    Hỗ trợ: ConcatDataset (.datasets + cumulative_sizes), ImageFolder-style
+    (.samples = [(path, label)]), GCD-style (.data np.uint8, .image_paths).
+    """
+    from bisect import bisect_right
+    from PIL import Image
+
+    inner = getattr(ds, 'datasets', None)
+    if inner is not None and hasattr(ds, 'cumulative_sizes'):
+        sizes = ds.cumulative_sizes
+        child_idx = bisect_right(sizes, pos)
+        if child_idx >= len(inner):
+            return None
+        child_pos = pos - (sizes[child_idx - 1] if child_idx > 0 else 0)
+        return _raw_pil_and_transform(inner[child_idx], child_pos)
+
+    tr = getattr(ds, 'transform', None)
+    samples = getattr(ds, 'samples', None)
+    if samples is not None:
+        p = samples[pos][0]
+        return Image.open(p).convert('RGB'), tr
+    data = getattr(ds, 'data', None)
+    if data is not None:
+        x = data[pos]
+        if isinstance(x, str):
+            return Image.open(x).convert('RGB'), tr
+        arr = np.asarray(x)
+        if arr.dtype == np.uint8:
+            return Image.fromarray(arr), tr
+        return None
+    paths = getattr(ds, 'image_paths', None)
+    if paths is not None:
+        p = paths[pos]
+        p = p[0] if isinstance(p, (tuple, list)) else p
+        return Image.open(p).convert('RGB'), tr
+    return None
+
+
+def _make_pseudo_raw_lookup(unlabeled_dataset):
+    """Lookup (pil, transform) cho 1 pseudo sample theo 'pos' đã lưu lúc promote."""
+    def _lookup(s):
+        pos = s.get('pos')
+        if pos is None:
+            return None
+        try:
+            return _raw_pil_and_transform(unlabeled_dataset, pos)
+        except Exception:
+            return None
+    return _lookup
+
+
+def create_pseudo_dataset(pseudo_samples, raw_lookup=None):
+    """Create dataset from pseudo samples.
+
+    FIX identical-views (2026-11-17): sample pseudo KHÔNG còn trả
+    ``[img, img.clone()]`` (2 view giống hệt -> positive pair degenerate với
+    InfoNCE/SupCon). Thay bằng:
+      1. Ưu tiên nạp ảnh GỐC qua ``raw_lookup`` (theo 'pos') rồi re-augment 2
+         view MỚI mỗi lần lấy bằng chính view generator của dataset train.
+      2. Không lấy được raw -> dùng cặp 2 augmentations KHÁC NHAU đã lưu lúc
+         promote ('image' + 'image1').
+    """
+    import torch
+
     class PseudoDataset(torch.utils.data.Dataset):
-        def __init__(self, samples):
-            self.images = [s['image'] for s in samples]
+        def __init__(self, samples, raw_lookup=None):
             self.labels = [s['label'] for s in samples]
             # keep the real uq_idxs from the unlabeled pool so exclusion logic works
             self.uq_idxs = [s['uq_idx'] for s in samples]
-        
+            self.pils, self.transforms, self.images, self.images1 = [], [], [], []
+            for s in samples:
+                v0, v1 = s['image'], s.get('image1', s['image'])
+                pil = tr = None
+                if raw_lookup is not None:
+                    try:
+                        hit = raw_lookup(s)
+                    except Exception:
+                        hit = None
+                    if hit is not None:
+                        pil, tr = hit
+                if pil is not None and tr is not None:
+                    self.pils.append(pil)
+                    self.transforms.append(tr)
+                    self.images.append(None)
+                    self.images1.append(None)
+                else:
+                    self.pils.append(None)
+                    self.transforms.append(None)
+                    self.images.append(v0)
+                    self.images1.append(v1)
+
         def __len__(self):
-            return len(self.images)
-        
+            return len(self.labels)
+
         def __getitem__(self, idx):
             # Training loop expects 2 contrastive views per sample
-            # (ContrastiveLearningViewGenerator); emit duplicated views so
-            # collate/chunk(2) work like real dataset items.
+            # (ContrastiveLearningViewGenerator); same item shape as real data.
+            if self.pils[idx] is not None:
+                try:
+                    views = self.transforms[idx](self.pils[idx])
+                except Exception:
+                    views = None
+                if views is not None:
+                    if not isinstance(views, (list, tuple)):
+                        views = [views, views]
+                    if len(views) == 1:
+                        views = [views[0], views[0]]
+                    return list(views), self.labels[idx], self.uq_idxs[idx]
             img = self.images[idx]
-            return [img, img.clone()], self.labels[idx], self.uq_idxs[idx]
-    
-    return PseudoDataset(pseudo_samples)
+            # hai view KHÁC nhau đã lưu lúc promote (fallback khi thiếu raw)
+            return [img, self.images1[idx]], self.labels[idx], self.uq_idxs[idx]
+
+    return PseudoDataset(pseudo_samples, raw_lookup=raw_lookup)
 
 
 def update_train_loader(train_loader, train_dataset, new_pseudo_samples):
@@ -1975,7 +2624,10 @@ def update_train_loader(train_loader, train_dataset, new_pseudo_samples):
     if not new_pseudo_samples:
         return train_loader
     
-    pseudo_dataset = create_pseudo_dataset(new_pseudo_samples)
+    pseudo_dataset = create_pseudo_dataset(
+        new_pseudo_samples,
+        raw_lookup=_make_pseudo_raw_lookup(train_dataset.unlabelled_dataset),
+    )
     
     # Get original labeled and unlabeled
     original_labeled = train_dataset.labelled_dataset
@@ -2048,10 +2700,20 @@ def _pseudo_vis_dir(args):
 def build_uq_to_true_label(unlabelled_dataset):
     """Map uq_idx -> true label over the whole unlabeled pool.
 
-    Works for ConcatDataset (recursing) and plain datasets exposing .targets.
-    Used ONLY by the contamination audit.
+    Works for ConcatDataset / Subset (the ProtoTail v2 holdout adds a Subset)
+    and plain datasets exposing .targets. Used ONLY by the contamination audit.
     """
     mapping = {}
+    try:
+        from model.prototail_v2 import dataset_labels as _labels, dataset_uq_ids as _uqs
+        labels = _labels(unlabelled_dataset)
+        uqs = _uqs(unlabelled_dataset)
+        if labels and len(labels) == len(uqs):
+            for t, u in zip(labels, uqs):
+                mapping[int(u)] = int(t)
+            return mapping
+    except Exception:
+        pass
 
     def _walk(ds):
         # ConcatDataset of LT subsets (the cifar pipeline builds 2 sub-datasets)
@@ -2072,6 +2734,16 @@ def build_uq_to_true_label(unlabelled_dataset):
 
 def count_labeled_per_class(labeled_dataset, out):
     """Accumulate per-class counts of the original labeled set into `out`."""
+    try:
+        from model.prototail_v2 import dataset_labels as _labels
+        labels = _labels(labeled_dataset)
+        if labels:
+            for t in labels:
+                c = int(t)
+                out[c] = out.get(c, 0) + 1
+            return
+    except Exception:
+        pass
     targets = getattr(labeled_dataset, 'targets', None)
     if targets is not None:
         for t in targets:
@@ -2555,6 +3227,87 @@ if __name__ == "__main__":
     parser.add_argument("--ablate-confidence", action="store_true", default=False, help="Disable confidence filtering for novel updates")
     parser.add_argument("--ablate-adaptive-capacity", action="store_true", default=False, help="Disable distribution-adaptive gating")
     parser.add_argument("--ablate-concat-eval", action="store_true", default=False, help="Evaluate using CLS only instead of Concat (W2 baseline)")
+    parser.add_argument("--part-ema-include-pseudo", action="store_true", default=False,
+                        help="(legacy/debug) cho sample pseudo đã promote vào known-EMA của part_bank. "
+                             "Mặc định LOẠI để tránh nhiễm prototype bằng nhãn dự đoán (audit: 25-50%/iter novel swallowed).")
+
+    # ---- ProtoTail v2 (feature-flagged; v1 remains the default) ----
+    parser.add_argument("--prototail-v2", action="store_true", default=False,
+                        help="Master switch: evidence ledger + class-wise score norm + "
+                             "sample credibility + holdout-calibrated v2 selection.")
+    parser.add_argument("--pt-ledger", action="store_true", default=False,
+                        help="Use the time-decayed evidence ledger instead of EMA prototypes.")
+    parser.add_argument("--pt-class-norm", action="store_true", default=False,
+                        help="Normalise part scores per class against non-members (nu_c, sigma_c).")
+    parser.add_argument("--pt-sample-cred", action="store_true", default=False,
+                        help="Use lambda_i = lambda * min Z over global top-k (shared by classes).")
+    parser.add_argument("--pt-selection-v2", action="store_true", default=False,
+                        help="Use holdout/LCB/FDR selection instead of the v1 known/novel doors.")
+    parser.add_argument("--pt-holdout", action="store_true", default=False,
+                        help="Hold out labeled samples for calibration; labels are used only for auditing.")
+    parser.add_argument("--pt-fdr", action="store_true", default=False,
+                        help="Apply Benjamini-Hochberg FDR control to class/group gates.")
+    parser.add_argument("--pt-novel-purity", action="store_true", default=False,
+                        help="Mandatory known-holdout leak guard for accepted novel dimensions.")
+    parser.add_argument("--pt-no-fdr", action="store_true", default=False,
+                        help="Disable FDR even when --prototail-v2 is active (ablation).")
+    parser.add_argument("--pt-no-novel-purity", action="store_true", default=False,
+                        help="Disable the novel purity guard (ablation).")
+    parser.add_argument("--pt-no-split-guard", action="store_true", default=False,
+                        help="Disable the per-dimension split guard (ablation).")
+    parser.add_argument("--pt-no-merge-guard", action="store_true", default=False,
+                        help="Disable the per-dimension merge guard (ablation).")
+    parser.add_argument("--pt-decay", type=float, default=0.5,
+                        help="Per-epoch evidence decay beta (default 0.5).")
+    parser.add_argument("--pt-history-epochs", type=int, default=3,
+                        help="Number of recent epochs kept for sample stability rho_i.")
+    parser.add_argument("--pt-shrink-k", type=float, default=10.0,
+                        help="Initial prior strength k for shrunk prototypes.")
+    parser.add_argument("--pt-shrink-k-mode", type=str, default="fixed",
+                        choices=["fixed", "buhlmann"],
+                        help="fixed = fixed k; buhlmann = re-estimate from within/between variance.")
+    parser.add_argument("--pt-topk", type=int, default=5,
+                        help="Top-k global classes used for sample-level lambda_i.")
+    parser.add_argument("--pt-self-distill", type=float, default=None,
+                        help="Weight for v2 self-distillation on unlabeled fused logits; "
+                             "None = use 0.5 with --prototail-v2, 0.0 otherwise.")
+    parser.add_argument("--pt-alpha-quantile", type=float, default=0.10,
+                        help="Lower posterior quantile used by Beta-Binomial gates.")
+    parser.add_argument("--pt-threshold", type=float, default=0.85,
+                        help="Shared precision/agreement threshold for selection gates.")
+    parser.add_argument("--pt-fdr-q", type=float, default=0.10,
+                        help="Benjamini-Hochberg target FDR.")
+    parser.add_argument("--pt-holdout-ratio", type=float, default=0.15,
+                        help="Fraction of labeled samples per class moved to calibration.")
+    parser.add_argument("--pt-holdout-min-labels", type=int, default=5,
+                        help="Only classes with at least this many labels are split.")
+    parser.add_argument("--pt-rho-min", type=float, default=0.5,
+                        help="Minimum stability rho_i for a sample-gate candidate.")
+    parser.add_argument("--pt-conf-min", type=float, default=0.0,
+                        help="Absolute confidence floor; class quantiles are used when available.")
+    parser.add_argument("--pt-conf-quantile", type=float, default=0.10,
+                        help="Per-class confidence threshold quantile from holdout.")
+    parser.add_argument("--pt-budget-min", type=int, default=20,
+                        help="Minimum promotion budget for a well-evidenced class/group.")
+    parser.add_argument("--pt-budget-max", type=int, default=500,
+                        help="Maximum promotion budget for a low-evidence class/group.")
+    parser.add_argument("--pt-identity", type=float, default=0.5,
+                        help="Minimum cosine similarity to a novel dimension core.")
+    parser.add_argument("--pt-novel-leak-max", type=float, default=0.05,
+                        help="Maximum known-holdout leak rate allowed for a novel dimension.")
+    parser.add_argument("--pt-split-silhouette", type=float, default=0.25,
+                        help="2-means silhouette above which a novel dimension is likely split.")
+    parser.add_argument("--pt-merge-cos", type=float, default=0.95,
+                        help="Cosine above which two novel dimension centroids are likely merged.")
+    parser.add_argument("--pt-sel-start", type=float, default=0.25,
+                        help="Start of v2 selection window as training progress.")
+    parser.add_argument("--pt-sel-end", type=float, default=0.75,
+                        help="End of v2 selection window as training progress.")
+    parser.add_argument("--pt-sel-every", type=float, default=0.05,
+                        help="Selection interval as training progress (0.05 = every 5%).")
+    parser.add_argument("--pt-holdout-classes", type=float, default=0.0,
+                        help="Reserved: fraction of known classes used as fake novel; "
+                             "currently recorded for future calibration runs.")
 
     # ----------------------
     # INIT
@@ -2568,6 +3321,14 @@ if __name__ == "__main__":
         with open('configs/' + args.config_file, 'r') as f:
             args = parser.parse_args(f.read().split())
 
+    # The v2 components need the latent part branch.  The master switch makes
+    # this automatic; v1 remains unchanged when no --pt-* flag is present.
+    if (getattr(args, 'prototail_v2', False)
+            or getattr(args, 'pt_ledger', False)
+            or getattr(args, 'pt_class_norm', False)
+            or getattr(args, 'pt_sample_cred', False)
+            or getattr(args, 'pt_selection_v2', False)):
+        args.use_parts = True
 
     device = torch.device('cuda:0')
     args = get_class_splits(args)
@@ -2635,6 +3396,48 @@ if __name__ == "__main__":
                                                                                          test_transform,
                                                                                          args)
 
+    # ---- ProtoTail v2: optional labeled holdout for calibration ----
+    # Keep the original labeled counts for Support_known before moving samples.
+    from model.prototail_v2 import (
+        dataset_labels as _pt_dataset_labels,
+        make_holdout_split as _pt_make_holdout_split,
+        set_dataset_transform as _pt_set_dataset_transform,
+    )
+    _pt_master = bool(getattr(args, 'prototail_v2', False))
+    _pt_holdout_on = (_pt_master and not getattr(args, 'pt_no_holdout', False)) \
+        or bool(getattr(args, 'pt_holdout', False))
+    try:
+        _pt_orig_labels = _pt_dataset_labels(train_dataset.labelled_dataset)
+        _pt_support = {}
+        for _c in _pt_orig_labels:
+            _pt_support[int(_c)] = _pt_support.get(int(_c), 0) + 1
+        args.pt_support_counts = _pt_support
+    except Exception as _e:
+        args.pt_support_counts = {}
+        args.logger.warning(f'[PT-v2] support count failed: {_e}')
+    if _pt_holdout_on:
+        _pt_seed = int(getattr(args, 'seed', 0) or 0)
+        if _pt_seed < 0:
+            _pt_seed = 0
+        _pt_info = _pt_make_holdout_split(
+            train_dataset,
+            ratio=float(getattr(args, 'pt_holdout_ratio', 0.15)),
+            min_labels=int(getattr(args, 'pt_holdout_min_labels', 5)),
+            seed=_pt_seed,
+        )
+        args._pt_holdout_uq_to_label = dict(_pt_info.get('uq_to_label', {}))
+        args._pt_holdout_size = int(_pt_info.get('n_holdout', 0))
+        if _pt_info.get('enabled'):
+            args.logger.info(
+                f"[PT-v2] Holdout calibration: {args._pt_holdout_size} labeled samples "
+                f"moved to D_U (kept={_pt_info.get('n_kept')}, labels used only for gates).")
+        else:
+            args.logger.warning(
+                f"[PT-v2] Holdout requested but disabled: {_pt_info.get('reason', 'unknown')}")
+    else:
+        args._pt_holdout_uq_to_label = {}
+        args._pt_holdout_size = 0
+
     # Train seed: --seed >= 0 -> dung seed do (repeats r1/r2/r3 cho paper).
     # --seed -1 (default) -> legacy: randint sau khi pipeline da seed cung 416
     # nen LUON ra 20364 (da verify) — giu de so duoc voi moi run cu.
@@ -2669,13 +3472,11 @@ if __name__ == "__main__":
     train_labelled_test_trans = deepcopy(train_dataset.labelled_dataset)
     train_unlabelled_test_trans = deepcopy(train_dataset.unlabelled_dataset)
 
-    train_all_test_trans.labelled_dataset.transform = test_transform
-
-    train_all_test_trans.unlabelled_dataset.datasets[0].transform = test_transform
-    train_all_test_trans.unlabelled_dataset.datasets[1].transform = test_transform
-    train_unlabelled_test_trans.datasets[0].transform = test_transform
-    train_unlabelled_test_trans.datasets[1].transform = test_transform
-    train_labelled_test_trans.transform = test_transform
+    # Recursive setters support Subset / ConcatDataset created by the holdout.
+    _pt_set_dataset_transform(train_all_test_trans.labelled_dataset, test_transform)
+    _pt_set_dataset_transform(train_all_test_trans.unlabelled_dataset, test_transform)
+    _pt_set_dataset_transform(train_unlabelled_test_trans, test_transform)
+    _pt_set_dataset_transform(train_labelled_test_trans, test_transform)
 
 
     # --------------------

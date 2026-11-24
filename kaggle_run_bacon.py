@@ -164,9 +164,16 @@ def _shallowest(cands):
     return sorted(cands, key=lambda p: len(p.parts))
 
 
-def find_herbarium(dirs, children):
-    """Root = parent of a dir holding exactly 683 class subdirs (small-train ...)."""
-    cands = _shallowest([d for d in dirs if d != KAGGLE_INPUT and len(children.get(d, [])) == 683])
+def find_herbarium(dirs, files):
+    """Root = parent of a dir holding exactly 683 class subdirs (small-train ...).
+
+    FINDERS gọi đồng nhất fn(dirs, files) — đếm subdir qua Counter thay vì
+    children map (bug cũ: signature (dirs, children) nhận nhầm 'files' list
+    -> AttributeError khi best-effort locate chạy cho dataset khác herbarium).
+    """
+    from collections import Counter
+    cnt = Counter(d.parent for d in dirs)
+    cands = _shallowest([d for d in dirs if d != KAGGLE_INPUT and cnt[d] == 683])
     for d in cands:
         parent = d.parent
         return parent if parent.parent.exists() else d
@@ -233,12 +240,80 @@ def find_cifar10(dirs, files):
 
 
 def find_imagenet(dirs, files):
+    # Case chuẩn: một dir chứa cả train + val
     for d in _shallowest(dirs):
         low = d.name.lower().replace("_", "").replace("-", "")
         if "imagenet" in low or low == "in1k":
             names = {c.name for c in _children_of(d, dirs)}
             if {"train", "val"} <= names or "ImageNet_100" in d.name:
                 return d
+    # Case Kaggle: dataset cắt nhiều part (vd imagenet100-cmc:
+    # imagenet100_cmc_train_part01..NN/train/<wnid>, ..._val_partNN/val/<wnid>)
+    # -> merge các part bằng symlink thành 1 root duy nhất.
+    merged = _merge_imagenet_parts(dirs)
+    if merged is not None:
+        return merged
+    return None
+
+
+def _merge_imagenet_parts(dirs):
+    """Gom các part imagenet (train_partNN/train, val_partNN/val) thành 1 root.
+
+    Trả root /tmp/imagenet100_merged với train/<wnid> + val/<wnid> là symlink
+    tới các wnid dir trong từng part. Loader (data/imagenet.py) đọc txt theo
+    path 'train/<wnid>/<file>' nên root này dùng như root nguyên vẹn.
+    (Đặt ở /tmp thay vì /kaggle/working để kernel-output không phải archive
+    cả cây symlink trỏ vào /kaggle/input.)
+    """
+    import re
+    base = Path(os.environ.get("BACON_MERGE_ROOT", "/tmp"))
+    train_parts, val_parts = [], []
+    pat = re.compile(r"^imagenet\d*.*?(train|val).*?part\d*$", re.IGNORECASE)
+    for d in dirs:
+        m = pat.match(d.name)
+        if not m:
+            continue
+        inner = _children_of(d, dirs)
+        sub = next((c for c in inner if c.name == m.group(1).lower()), None)
+        if sub is not None:
+            (train_parts if m.group(1).lower() == "train" else val_parts).append(sub)
+    if not train_parts and not val_parts:
+        return None
+
+    root = base / "imagenet100_merged"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"[data-locate] cannot create merge root {root}: {e}")
+        return None
+    skipped = 0
+    for kind, parts in (("train", train_parts), ("val", val_parts)):
+        if not parts:
+            continue
+        kind_dir = root / kind
+        kind_dir.mkdir(exist_ok=True)
+        for part in parts:
+            try:
+                entries = sorted((e for e in os.scandir(part) if e.is_dir()),
+                                 key=lambda e: e.name)
+            except OSError:
+                continue
+            for e in entries:
+                target = kind_dir / e.name
+                if target.exists():
+                    skipped += 1
+                    continue
+                try:
+                    os.symlink(e.path, target)
+                except OSError as err:
+                    print(f"[data-locate] symlink failed for {e.path}: {err}")
+    if skipped:
+        print(f"[data-locate] imagenet merge: {skipped} wnid dir(s) already present (kept first)")
+    ok = (root / "train").is_dir() and (root / "val").is_dir()
+    if ok:
+        print(f"[data-locate] merged imagenet parts -> {root} "
+              f"({len(train_parts)} train parts, {len(val_parts)} val parts)")
+        return root
     return None
 
 
@@ -306,14 +381,20 @@ def maybe_extract_archives(dataset, files) -> Path | None:
     return EXTRACT_DIR if extracted_any else None
 
 
-def find_dino_offline(dirs, files):
+def find_dino_offline(dirs, files, backbone="dinov2_vitb14"):
     repo = None
     weights = None
+    bb = (backbone or "dinov2_vitb14").replace("-", "_")
+    want_reg = bb.endswith("_reg")
     for f in files:
         if f.name == "hubconf.py" and repo is None:
             repo = f.parent
     for f in files:
-        if f.name.startswith("dinov2_vitb14") and f.name.endswith(".pth") and weights is None:
+        # Chỉ nhận file weights KHỚP biến thể backbone đang dùng: file reg4
+        # (register_tokens) không được cấp cho model non-reg — backbone.py
+        # sẽ copy nó vào hub cache theo tên non-reg và strict load nổ.
+        if (f.name.startswith(bb) and f.name.endswith(".pth")
+                and ("_reg" in f.name) == want_reg and weights is None):
             weights = f
     if repo is not None and "dinov2" not in repo.name.lower():
         better = [d for d in dirs if (d / "hubconf.py").is_file() and "dinov2" in d.name.lower()]
@@ -377,7 +458,54 @@ def build_bacon_command(a, exp_root: str) -> list:
     command.extend(["--early-stop-patience", str(int(a.early_stop_patience))])
 
     if a.resume_ckpt:
-        command.extend(["--resume", str(a.resume_ckpt)])
+        ckpt_target = str(a.resume_ckpt).strip().strip('"').strip("'")
+        if not os.path.isfile(ckpt_target):
+            import glob
+            import re
+            candidates = []
+            slug = os.path.basename(ckpt_target.rstrip("/\\")).strip('"\'')
+            search_dirs = [ckpt_target, f"/kaggle/input/{slug}", f"/kaggle/input/{slug.lower()}", "/kaggle/input"]
+            for sd in search_dirs:
+                if os.path.isdir(sd):
+                    candidates.extend(glob.glob(os.path.join(sd, "**", "model_last.pt"), recursive=True))
+                    candidates.extend(glob.glob(os.path.join(sd, "**", "model_epoch*.pt"), recursive=True))
+                    candidates.extend(glob.glob(os.path.join(sd, "**", "model_best*.pt"), recursive=True))
+                    candidates.extend(glob.glob(os.path.join(sd, "**", "*.pt"), recursive=True))
+            # Deduplicate preserving order
+            seen = set()
+            candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+            if candidates:
+                last_matches = [c for c in candidates if os.path.basename(c) == "model_last.pt"]
+                epoch_matches = [c for c in candidates if "model_epoch" in os.path.basename(c)]
+                best_matches = [c for c in candidates if "model_best" in os.path.basename(c)]
+                if last_matches:
+                    ckpt_target = last_matches[0]
+                elif epoch_matches:
+                    def _ep_num(path):
+                        m = re.findall(r'model_epoch(\d+)\.pt', os.path.basename(path))
+                        return int(m[0]) if m else -1
+                    ckpt_target = sorted(epoch_matches, key=_ep_num)[-1]
+                elif best_matches:
+                    ckpt_target = best_matches[0]
+                else:
+                    ckpt_target = candidates[0]
+                print(f"[Kaggle Runner] Auto-resolved resume checkpoint: {ckpt_target}")
+            elif KAGGLE_INPUT.exists():
+                print(f"\n[Kaggle Runner] ERROR: Could not find any checkpoint file (.pt) for resume!")
+                print(f"  Target requested: {a.resume_ckpt}")
+                print(f"  Searched paths  :")
+                for sd in search_dirs:
+                    print(f"    - {sd} (exists: {os.path.isdir(sd)})")
+                print(f"\n[Kaggle Runner] Contents of /kaggle/input:")
+                if os.path.isdir("/kaggle/input"):
+                    for item in sorted(os.listdir("/kaggle/input")):
+                        sub = os.path.join("/kaggle/input", item)
+                        print(f"    /kaggle/input/{item} ({'dir' if os.path.isdir(sub) else 'file'})")
+                print("\n[Kaggle Runner] IMPORTANT: If resuming from another Kaggle account, ensure that:")
+                print("  1. The parent kernel has finished running and produced checkpoints.")
+                print("  2. The parent kernel is set to PUBLIC in Kaggle Settings so this account can access its output.\n")
+                sys.exit(1)
+        command.extend(["--resume", ckpt_target])
     if a.time_budget_hours and float(a.time_budget_hours) > 0:
         command.extend(["--time-budget-hours", str(float(a.time_budget_hours))])
     if int(a.save_freq) > 0:
@@ -531,7 +659,7 @@ def main():
                 env[_ENV_VAR_BY_DATASET[ds]] = str(r)
 
         # offline DINOv2 (torch.hub repo + vitb14 weights)
-        dino_repo, dino_weights = find_dino_offline(dirs, files)
+        dino_repo, dino_weights = find_dino_offline(dirs, files, backbone=args.backbone)
         if dino_repo is not None:
             env["BACON_DINO_REPO"] = str(dino_repo)
             print(f"[dino-offline] BACON_DINO_REPO={dino_repo}")

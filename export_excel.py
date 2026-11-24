@@ -39,12 +39,16 @@ MODELS = [
 ]
 
 DATASETS = [
+    ("cifar100", "CIFAR-100", ["cifar100", "cifar", "cifar_100", "cifar-100"]),
+    ("imagenet100", "ImageNet-100", ["imagenet100", "imagenet", "imagenet_100", "imagenet-100"]),
     ("cub", "CUB-200-2011", ["cub", "cub200"]),
     ("car", "Stanford Cars", ["car", "cars", "scars", "stanford_cars"]),
     ("air", "FGVC Aircraft", ["air", "aircraft", "fgvc_aircraft"]),
 ]
 
 DATASET_MAP = {
+    "cifar100": "cifar100", "cifar": "cifar100", "cifar_100": "cifar100", "cifar-100": "cifar100",
+    "imagenet100": "imagenet100", "imagenet": "imagenet100", "imagenet_100": "imagenet100", "imagenet-100": "imagenet100",
     "cub": "cub", "cub200": "cub",
     "car": "car", "cars": "car", "scars": "car", "stanford_cars": "car",
     "air": "air", "aircraft": "air", "fgvc_aircraft": "air",
@@ -82,16 +86,16 @@ def normalize_canonical_key(run_name, fname):
     # 1. Model
     m = "bacon" if "bacon" in combined else ("simgcd" if "simgcd" in combined else "bacon")
     
-    # 2. Dataset
+    # 2. Dataset (ưu tiên key dài trước)
     d = ""
-    for k, v in DATASET_MAP.items():
-        if f"_{k}_" in combined or f"_{k}" in combined or f"{k}_" in combined or f"-{k}-" in combined:
-            d = v
+    for k in sorted(DATASET_MAP.keys(), key=len, reverse=True):
+        if f"_{k}_" in combined or f"_{k}" in combined or f"{k}_" in combined:
+            d = DATASET_MAP[k]
             break
 
     # 3. Imbalance Ratio
     imb = ""
-    for i in ["imb20", "imb50", "imb100", "imb10"]:
+    for i in ["imb100", "imb50", "imb20", "imb10"]:
         if i in combined:
             imb = i
             break
@@ -168,9 +172,9 @@ def parse_single_log(filepath, metric_mode="best"):
 
     max_epoch_seen = 0
 
-    # Đọc từ JSON lines
-    for line in lines:
+    for i, line in enumerate(lines):
         l_str = line.strip()
+        # 1. JSON lines
         if l_str.startswith("{") and l_str.endswith("}"):
             try:
                 data = json.loads(l_str)
@@ -226,6 +230,74 @@ def parse_single_log(filepath, metric_mode="best"):
 
             except Exception:
                 pass
+
+        # 2. Text line: [UNLABELED-TRAIN EVAL]
+        m_unl = re.search(r"\[UNLABELED-TRAIN EVAL\]\s+Epoch\s+(\d+):\s+All\s+([\d\.]+)\s+\|\s+Known\s+([\d\.]+)\s+\|\s+Novel\s+([\d\.]+)(?:\s+\|\s+H-Score\s+([\d\.]+))?", line)
+        if m_unl:
+            ep = int(m_unl.group(1))
+            if ep > max_epoch_seen:
+                max_epoch_seen = ep
+            all_v = float(m_unl.group(2))
+            old_v = float(m_unl.group(3))
+            new_v = float(m_unl.group(4))
+            h_v = float(m_unl.group(5)) if m_unl.group(5) else (2 * old_v * new_v / (old_v + new_v) if (old_v + new_v) > 0 else 0.0)
+
+            km, kme, kf, um, ume, uf = -1.0, -1.0, -1.0, -1.0, -1.0, -1.0
+            for j in range(1, 4):
+                if i + j < len(lines):
+                    next_l = lines[i+j]
+                    m_k = re.search(r"Known \[Many:\s*([\d\.\-]+),\s*Med:\s*([\d\.\-]+),\s*Few:\s*([\d\.\-]+)\]", next_l)
+                    m_u = re.search(r"Novel \[Many:\s*([\d\.\-]+),\s*Med:\s*([\d\.\-]+),\s*Few:\s*([\d\.\-]+)\]", next_l)
+                    if m_k:
+                        km, kme, kf = float(m_k.group(1)), float(m_k.group(2)), float(m_k.group(3))
+                    if m_u:
+                        um, ume, uf = float(m_u.group(1)), float(m_u.group(2)), float(m_u.group(3))
+                    if m_k or m_u:
+                        break
+
+            u_dict = {
+                "epoch": ep, "all": all_v, "old": old_v, "new": new_v, "h_score": h_v,
+                "k_many": km, "k_med": kme, "k_few": kf, "u_many": um, "u_med": ume, "u_few": uf
+            }
+            if ep == 200:
+                final_unl_item = u_dict
+            if all_v > best_unl_all:
+                best_unl_all = all_v
+                best_unl_item = u_dict
+
+        # 3. Text line: [DISJOINT-TEST EVAL]
+        m_test = re.search(r"\[DISJOINT-TEST EVAL\]\s+Epoch\s+(\d+):\s+All\s+([\d\.]+)\s+\|\s+Known\s+([\d\.]+)\s+\|\s+Novel\s+([\d\.]+)(?:\s+\|\s+H-Score\s+([\d\.]+))?", line)
+        if m_test:
+            ep = int(m_test.group(1))
+            if ep > max_epoch_seen:
+                max_epoch_seen = ep
+            t_all_v = float(m_test.group(2))
+            t_old_v = float(m_test.group(3))
+            t_new_v = float(m_test.group(4))
+            t_h_v = float(m_test.group(5)) if m_test.group(5) else (2 * t_old_v * t_new_v / (t_old_v + t_new_v) if (t_old_v + t_new_v) > 0 else 0.0)
+
+            km, kme, kf, um, ume, uf = -1.0, -1.0, -1.0, -1.0, -1.0, -1.0
+            for j in range(1, 4):
+                if i + j < len(lines):
+                    next_l = lines[i+j]
+                    m_k = re.search(r"Known \[Many:\s*([\d\.\-]+),\s*Med:\s*([\d\.\-]+),\s*Few:\s*([\d\.\-]+)\]", next_l)
+                    m_u = re.search(r"Novel \[Many:\s*([\d\.\-]+),\s*Med:\s*([\d\.\-]+),\s*Few:\s*([\d\.\-]+)\]", next_l)
+                    if m_k:
+                        km, kme, kf = float(m_k.group(1)), float(m_k.group(2)), float(m_k.group(3))
+                    if m_u:
+                        um, ume, uf = float(m_u.group(1)), float(m_u.group(2)), float(m_u.group(3))
+                    if m_k or m_u:
+                        break
+
+            t_dict = {
+                "epoch": ep, "all": t_all_v, "old": t_old_v, "new": t_new_v, "h_score": t_h_v,
+                "k_many": km, "k_med": kme, "k_few": kf, "u_many": um, "u_med": ume, "u_few": uf
+            }
+            if ep == 200:
+                final_test_item = t_dict
+            if t_all_v > best_test_all:
+                best_test_all = t_all_v
+                best_test_item = t_dict
 
     # Regex fallback cho summary blocks
     # 1. Best Unlabeled Train
@@ -326,8 +398,17 @@ def parse_single_log(filepath, metric_mode="best"):
     if not chosen_test and final_test_item:
         chosen_test = final_test_item
 
+    has_metrics = (chosen_unl is not None or chosen_test is not None)
+
     is_done = False
-    if "Training finished successfully!" in content or (max_epoch_seen >= 200) or (final_unl_item is not None):
+    if has_metrics and (
+        "Training finished successfully!" in content or
+        (max_epoch_seen >= 200) or
+        (final_unl_item is not None) or
+        ("FINAL EVALUATION REPORT" in content) or
+        ("[TIME-BUDGET]" in content) or
+        ("FINAL SUMMARY" in content)
+    ):
         is_done = True
 
     status = "Hoàn thành" if is_done else (f"Đang chạy (Ep {max_epoch_seen})" if max_epoch_seen > 0 else "Chưa có kết quả")
@@ -340,6 +421,8 @@ def parse_single_log(filepath, metric_mode="best"):
         "dt": file_dt,
         "status": status,
         "is_done": is_done,
+        "has_metrics": has_metrics,
+        "max_epoch_seen": max_epoch_seen,
         # Unlabeled Train
         "unl_epoch": chosen_unl["epoch"] if chosen_unl else None,
         "unl_metrics": chosen_unl,
@@ -374,12 +457,15 @@ def parse_all_logs(log_dir, metric_mode="best"):
             candidates[canon_key] = item
         else:
             prev = candidates[canon_key]
-            if item["is_done"] and not prev["is_done"]:
+            if item["has_metrics"] and not prev["has_metrics"]:
                 candidates[canon_key] = item
-            elif item["is_done"] and prev["is_done"]:
-                if item["dt"] > prev["dt"]:
-                    candidates[canon_key] = item
-            elif not prev["is_done"] and item["dt"] > prev["dt"]:
+            elif not item["has_metrics"] and prev["has_metrics"]:
+                pass
+            elif item["is_done"] and not prev["is_done"]:
+                candidates[canon_key] = item
+            elif not item["is_done"] and prev["is_done"]:
+                pass
+            elif item["dt"] > prev["dt"]:
                 candidates[canon_key] = item
 
     return candidates
@@ -408,8 +494,9 @@ def generate_table_rows(logs_data, split_type="unlabeled_train", metric_mode="be
     ]
 
     rows = []
+    total_cfgs = len(DATASETS) * len(IMB_RATIOS) * len(CONFIGS)
     rows.append([
-        f"BẢNG TỔNG HỢP KẾT QUẢ {split_title} — MÔ HÌNH BACON (27 CẤU HÌNH x 3 DATASETS) "
+        f"BẢNG TỔNG HỢP KẾT QUẢ {split_title} — MÔ HÌNH BACON ({total_cfgs} CẤU HÌNH x {len(DATASETS)} DATASETS) "
         f"Quy ước trực quan ({split_title}): IN ĐẬM (nền xanh lá nhạt) = Tốt nhất (1st) | GẠCH CHÂN (nền xanh dương nhạt) = Tốt nhì (2nd) | Dấu '-' = Chưa chạy / N/A",
         f"CHỈ SỐ CHUNG ({split_title}) All (%)", "Old (%)", "New (%)", "H-Score",
         "KNOWN CLASSES (OLD) Many (%)", "Med (%)", "Few (%)",
